@@ -14,15 +14,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# НАСТРОЙКИ - ИЗМЕНИТЕ ЗДЕСЬ
+
+# НАСТРОЙКИ 
 # ============================================================================
 START_DATE = "01012024:0000"  # Формат: DDMMYYYY:HHMM
 SYMBOL = "BTCUSDT"            # Торговая пара
 CATEGORY = "linear"           # Тип контракта: 'linear' или 'inverse'
-OI_INTERVAL = "1d"           # Интервал для Open Interest: '5min', '15min', '30min', '1h', '4h', '1d'
-
-# Выберите что скачивать (True/False)
+OI_INTERVAL = "1d"           # Интервал для Open Interest: '4h', '1d'
 DOWNLOAD_OPEN_INTEREST = True
 DOWNLOAD_FUNDING_RATE = True
 # ============================================================================
@@ -75,7 +73,7 @@ class BybitFuturesDataDownloader:
                     "intervalTime": interval,
                     "startTime": start_time,
                     "endTime": end_time,
-                    "limit": 200
+                    "limit": 1000
                 }
                 
                 if cursor:
@@ -111,7 +109,6 @@ class BybitFuturesDataDownloader:
                 logger.warning("Данные не найдены за указанный период")
                 return pd.DataFrame(columns=['timestamp', 'open_interest'])
             
-            # Обработка данных
             df = pd.DataFrame(all_data)
             df['timestamp'] = df['timestamp'].astype(int)
             df['open_interest'] = df['openInterest'].astype(float)
@@ -119,7 +116,6 @@ class BybitFuturesDataDownloader:
             df = df.sort_values('timestamp')
             df = df.drop_duplicates(subset=['timestamp'])
             
-            # Сохранение
             start_str = start_date.replace(':', '')
             end_str = datetime.datetime.now().strftime('%d%m%Y%H%M')
             output_file = f"open_interest_{self.symbol}_{start_str}-{end_str}.csv"
@@ -161,7 +157,7 @@ class BybitFuturesDataDownloader:
                     "symbol": self.symbol,
                     "startTime": start_time,
                     "endTime": end_time,
-                    "limit": 200
+                    "limit": 1000
                 }
                 
                 if cursor:
@@ -196,16 +192,14 @@ class BybitFuturesDataDownloader:
             if not all_data:
                 logger.warning("Данные не найдены за указанный период")
                 return pd.DataFrame(columns=['timestamp', 'funding_rate'])
-            
-            # Обработка данных
+
             df = pd.DataFrame(all_data)
             df['timestamp'] = df['fundingRateTimestamp'].astype(int)
             df['funding_rate'] = df['fundingRate'].astype(float)
             df = df[['timestamp', 'funding_rate']]
             df = df.sort_values('timestamp')
             df = df.drop_duplicates(subset=['timestamp'])
-            
-            # Сохранение
+
             start_str = start_date.replace(':', '')
             end_str = datetime.datetime.now().strftime('%d%m%Y%H%M')
             output_file = f"funding_rate_{self.symbol}_{start_str}-{end_str}.csv"
@@ -237,7 +231,7 @@ if __name__ == "__main__":
         
         results = {}
         
-        # Загружаем Open Interest
+        # Open Interest
         if DOWNLOAD_OPEN_INTEREST:
             logger.info("\n[1] Загрузка Open Interest...")
             logger.info("-"*70)
@@ -247,7 +241,7 @@ if __name__ == "__main__":
             logger.info("\nПервые 10 записей Open Interest:")
             print(oi_df.head(10).to_string(index=False))
         
-        # Загружаем Funding Rate
+        # Funding Rate
         if DOWNLOAD_FUNDING_RATE:
             logger.info("\n[2] Загрузка Funding Rate...")
             logger.info("-"*70)
@@ -256,8 +250,7 @@ if __name__ == "__main__":
             
             logger.info("\nПервые 10 записей Funding Rate:")
             print(fr_df.head(10).to_string(index=False))
-        
-        # Итоговая информация
+
         logger.info("\n" + "="*70)
         logger.info("✓ ЗАГРУЗКА УСПЕШНО ЗАВЕРШЕНА")
         logger.info("="*70)
@@ -273,5 +266,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("\n\n⚠ Прервано пользователем")
     except Exception as e:
-        logger.error(f"\n\n❌ Критическая ошибка: {e}")
+        logger.error(f"\n\n Критическая ошибка: {e}")
         raise

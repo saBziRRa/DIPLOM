@@ -5,279 +5,275 @@ import logging
 from pathlib import Path
 import time
 from typing import Optional
+import sys
+import argparse
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-
 logger = logging.getLogger(__name__)
 
-
-# ============================================================================
-# НАСТРОЙКИ - ИЗМЕНИТЕ ЗДЕСЬ
-# ============================================================================
-START_DATE = "01012024:0000"  # Формат: DDMMYYYY:HHMM
-SYMBOL = "BTCUSDT"            # Торговая пара
-CATEGORY = "linear"           # Тип контракта: 'linear' или 'inverse'
-OI_INTERVAL = "1h"           # Интервал для Open Interest: '5min', '15min', '30min', '1h', '4h', '1d'
-# ============================================================================
-
-
-class BybitFuturesDataDownloader:
-    """Загрузчик данных по фьючерсам с Bybit API v5"""
-    
-    def __init__(self, symbol: str = "BTCUSDT", category: str = "linear"):
-        self.symbol = symbol
-        self.category = category
-        self.base_url = "https://api.bybit.com"
-    
+class ByBitDataManager:
+    def __init__(self, base_file: str = "bybit_daily.csv"):
+        self.base_file = base_file
+        self.base_url = "https://api.bybit.com/v5/market/kline"
+        self.symbol = "BTCUSDT"
+        self.interval = "D"
+        
     def _parse_timestamp(self, timestamp: str) -> int:
-        """Конвертация формата DDMMYYYY:HHMM в Unix timestamp (миллисекунды)."""
+        """Convert DDMMYYYY:HHMM format to Unix timestamp in milliseconds."""
         try:
             dt = datetime.datetime.strptime(timestamp, "%d%m%Y:%H%M")
             return int(dt.timestamp() * 1000)
         except ValueError as e:
-            logger.error(f"Неверный формат даты: {timestamp}. Ожидается: DDMMYYYY:HHMM")
-            raise
-    
-    def download_open_interest(
-        self,
-        start_date: str,
-        interval: str = "1h"
-    ) -> pd.DataFrame:
-        """Скачивает Open Interest с заданной даты до текущего момента."""
-        try:
-            start_time = self._parse_timestamp(start_date)
-            end_time = int(datetime.datetime.now().timestamp() * 1000)
-            
-            logger.info(f"Загрузка Open Interest для {self.symbol}")
-            logger.info(f"Период: {start_date} -> {datetime.datetime.now().strftime('%d%m%Y:%H%M')}")
-            logger.info(f"Интервал: {interval}")
-            
-            endpoint = f"{self.base_url}/v5/market/open-interest"
-            all_data = []
-            cursor = None
-            page = 0
-            
-            while True:
-                page += 1
-                params = {
-                    "category": self.category,
-                    "symbol": self.symbol,
-                    "intervalTime": interval,
-                    "startTime": start_time,
-                    "endTime": end_time,
-                    "limit": 200
-                }
-                
-                if cursor:
-                    params["cursor"] = cursor
-                
-                logger.info(f"Страница {page}: запрос данных...")
-                
-                response = requests.get(endpoint, params=params, timeout=30)
-                response.raise_for_status()
-                data = response.json()
-                
-                if data['retCode'] != 0:
-                    raise Exception(f"Ошибка API: {data['retMsg']}")
-                
-                records = data['result']['list']
-                next_cursor = data['result'].get('nextPageCursor', '')
-                
-                if not records:
-                    logger.info("Больше данных нет")
-                    break
-                
-                all_data.extend(records)
-                logger.info(f"Получено {len(records)} записей | Всего: {len(all_data)}")
-                
-                if not next_cursor or next_cursor == cursor:
-                    logger.info("Достигнут конец данных")
-                    break
-                
-                cursor = next_cursor
-                time.sleep(0.12)
-            
-            if not all_data:
-                logger.warning("Данные не найдены за указанный период")
-                return pd.DataFrame(columns=['timestamp', 'open_interest'])
-            
-            # Обработка данных
-            df = pd.DataFrame(all_data)
-            df['timestamp'] = df['timestamp'].astype(int)
-            df['open_interest'] = df['openInterest'].astype(float)
-            df = df[['timestamp', 'open_interest']]
-            df = df.sort_values('timestamp')
-            df = df.drop_duplicates(subset=['timestamp'])
-            
-            logger.info(f"✓ Загружено {len(df)} записей Open Interest")
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Ошибка при загрузке Open Interest: {e}")
-            raise
-    
-    def download_funding_rate(
-        self,
-        start_date: str
-    ) -> pd.DataFrame:
-        """Скачивает Funding Rate с заданной даты до текущего момента."""
-        try:
-            start_time = self._parse_timestamp(start_date)
-            end_time = int(datetime.datetime.now().timestamp() * 1000)
-            
-            logger.info(f"Загрузка Funding Rate для {self.symbol}")
-            logger.info(f"Период: {start_date} -> {datetime.datetime.now().strftime('%d%m%Y:%H%M')}")
-            
-            endpoint = f"{self.base_url}/v5/market/funding/history"
-            all_data = []
-            cursor = None
-            page = 0
-            
-            while True:
-                page += 1
-                params = {
-                    "category": self.category,
-                    "symbol": self.symbol,
-                    "startTime": start_time,
-                    "endTime": end_time,
-                    "limit": 200
-                }
-                
-                if cursor:
-                    params["cursor"] = cursor
-                
-                logger.info(f"Страница {page}: запрос данных...")
-                
-                response = requests.get(endpoint, params=params, timeout=30)
-                response.raise_for_status()
-                data = response.json()
-                
-                if data['retCode'] != 0:
-                    raise Exception(f"Ошибка API: {data['retMsg']}")
-                
-                records = data['result']['list']
-                next_cursor = data['result'].get('nextPageCursor', '')
-                
-                if not records:
-                    logger.info("Больше данных нет")
-                    break
-                
-                all_data.extend(records)
-                logger.info(f"Получено {len(records)} записей | Всего: {len(all_data)}")
-                
-                if not next_cursor or next_cursor == cursor:
-                    logger.info("Достигнут конец данных")
-                    break
-                
-                cursor = next_cursor
-                time.sleep(0.12)
-            
-            if not all_data:
-                logger.warning("Данные не найдены за указанный период")
-                return pd.DataFrame(columns=['timestamp', 'funding_rate'])
-            
-            # Обработка данных
-            df = pd.DataFrame(all_data)
-            df['timestamp'] = df['fundingRateTimestamp'].astype(int)
-            df['funding_rate'] = df['fundingRate'].astype(float)
-            df = df[['timestamp', 'funding_rate']]
-            df = df.sort_values('timestamp')
-            df = df.drop_duplicates(subset=['timestamp'])
-            
-            logger.info(f"✓ Загружено {len(df)} записей Funding Rate")
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Ошибка при загрузке Funding Rate: {e}")
+            logger.error(f"Invalid timestamp format: {timestamp}. Expected format: DDMMYYYY:HHMM")
             raise
 
+    def _format_timestamp(self, timestamp_ms: int) -> str:
+        """Convert Unix timestamp in milliseconds to DDMMYYYY:HHMM format."""
+        dt = datetime.datetime.fromtimestamp(timestamp_ms / 1000)
+        return dt.strftime("%d%m%Y:%H%M")
+
+    def _get_latest_timestamp(self) -> Optional[int]:
+        """Get the latest timestamp from the base CSV file."""
+        try:
+            if Path(self.base_file).exists():
+                df = pd.read_csv(self.base_file)
+                if not df.empty:
+                    return int(df['timestamp'].max())
+            return None
+        except Exception as e:
+            logger.error(f"Error reading base file: {e}")
+            return None
+
+    def _probe_timestamp(self, timestamp: int) -> bool:
+        """Probe if data exists at the given timestamp."""
+        try:
+            params = {
+                "category": "linear",
+                "symbol": self.symbol,
+                "interval": self.interval,
+                "start": timestamp,
+                "end": timestamp + 86400000,  # Check next day (24 часа)
+                "limit": 1
+            }
+            
+            response = requests.get(self.base_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data['retCode'] != 0:
+                raise Exception(f"API Error: {data['retMsg']}")
+            
+            return len(data['result']['list']) > 0
+        except Exception as e:
+            logger.error(f"Error probing timestamp: {e}")
+            return False
+
+    def _get_earliest_timestamp(self) -> int:
+        """Find the earliest available timestamp for the symbol using binary search-like probing."""
+        try:
+            current_year = datetime.datetime.now().year
+            earliest_year = 2021
+            
+            earliest_found_year = None
+            year = current_year
+            while year >= earliest_year:
+                start_of_year = int(datetime.datetime(year, 1, 1).timestamp() * 1000)
+                if self._probe_timestamp(start_of_year):
+                    logger.info(f"Found data in year {year}")
+                    if year > earliest_year:
+                        prev_year_start = int(datetime.datetime(year - 1, 1, 1).timestamp() * 1000)
+                        if self._probe_timestamp(prev_year_start):
+                            logger.info(f"Found data in previous year {year - 1}, continuing search")
+                            year -= 1
+                            continue
+                    earliest_found_year = year
+                    break
+                year -= 1
+                time.sleep(0.1)
+            
+            if earliest_found_year is None:
+                raise Exception("No data found before 2018")
+            
+            logger.info(f"Earliest year with data: {earliest_found_year}")
+            earliest_found_month = None
+            for month in range(1, 13):
+                start_of_month = int(datetime.datetime(earliest_found_year, month, 1).timestamp() * 1000)
+                if self._probe_timestamp(start_of_month):
+                    logger.info(f"Found data in month {month} of {earliest_found_year}")
+                    earliest_found_month = month
+                    break
+                else:
+                    logger.info(f"No data in month {month} of {earliest_found_year}")
+                time.sleep(0.1)
+            
+            if earliest_found_month is None:
+                raise Exception(f"No data found in any month of {earliest_found_year}")
+            
+            logger.info(f"Earliest month with data: {earliest_found_month} in {earliest_found_year}")
+
+            earliest_found_day = None
+            for day in range(1, 32):
+                try:
+                    start_of_day = int(datetime.datetime(earliest_found_year, earliest_found_month, day).timestamp() * 1000)
+                    if self._probe_timestamp(start_of_day):
+                        logger.info(f"Found data on day {day} of month {earliest_found_month} in {earliest_found_year}")
+                        earliest_found_day = day
+                        break
+                    else:
+                        logger.info(f"No data in day {day} of month {earliest_found_month} in {earliest_found_year}")
+                except ValueError:
+                    continue
+                time.sleep(0.1)
+            
+            if earliest_found_day is None:
+                raise Exception(f"No data found in any day of month {earliest_found_month} in {earliest_found_year}")
+            
+            logger.info(f"Earliest day with data: {earliest_found_day} in {earliest_found_month}/{earliest_found_year}")
+            
+            start_of_day = int(datetime.datetime(earliest_found_year, earliest_found_month, earliest_found_day).timestamp() * 1000)
+            return start_of_day
+        
+        except Exception as e:
+            logger.error(f"Error finding earliest timestamp: {e}")
+            raise
+
+    def _fetch_data(self, start_time: int, end_time: int) -> pd.DataFrame:
+        """Fetch data from ByBit API."""
+        try:
+            params = {
+                "category": "linear",
+                "symbol": self.symbol,
+                "interval": self.interval,
+                "start": start_time,
+                "end": end_time,
+                "limit": 1000
+            }
+            
+            response = requests.get(self.base_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data['retCode'] != 0:
+                raise Exception(f"API Error: {data['retMsg']}")
+            
+            klines = data['result']['list']
+            df = pd.DataFrame(klines, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 
+                'volume', 'turnover'
+            ])
+            df['timestamp'] = df['timestamp'].astype(int)
+            return df
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error processing API response: {e}")
+            raise
+
+    def fetch(self) -> None:
+        """Fetch new data and update the base CSV file."""
+        try:
+            latest_timestamp = self._get_latest_timestamp()
+            current_time = int(datetime.datetime.now().timestamp() * 1000)
+            
+            if latest_timestamp is None:
+                start_time = self._get_earliest_timestamp()
+                logger.info("No existing data found. Starting from the beginning of ByBit history.")
+            else:
+                # Для дневных данных прибавляем ровно сутки (вместо 60000 мс = 1 минута)
+                start_time = latest_timestamp + 86400000  
+            
+            if start_time >= current_time:
+                logger.info("No new data to fetch")
+                return
+            
+            while start_time < current_time:
+                end_time = min(start_time + (1000 * 86400000), current_time)  
+                logger.info(f"Fetching daily data from {datetime.datetime.fromtimestamp(start_time/1000).strftime('%Y-%m-%d')} "
+                            f"to {datetime.datetime.fromtimestamp(end_time/1000).strftime('%Y-%m-%d')}")
+                
+                df = self._fetch_data(start_time, end_time)
+                if not df.empty:
+                    logger.info(f"Added {len(df)} daily candles")
+                    
+                    if Path(self.base_file).exists():
+                        existing_data = pd.read_csv(self.base_file)
+                        combined_data = pd.concat([existing_data, df], ignore_index=True)
+                        combined_data = combined_data.drop_duplicates(subset=['timestamp'])
+                        combined_data = combined_data.sort_values('timestamp')
+                    else:
+                        combined_data = df
+                    
+                    combined_data.to_csv(self.base_file, index=False)
+                    logger.info(f"Successfully updated {self.base_file} with {len(df)} new records")
+                else:
+                    logger.warning(f"No data found for period {datetime.datetime.fromtimestamp(start_time/1000).strftime('%Y-%m-%d')} "
+                                   f"to {datetime.datetime.fromtimestamp(end_time/1000).strftime('%Y-%m-%d')}")
+
+                start_time = end_time + 86400000  
+                time.sleep(0.1)
+        
+        except Exception as e:
+            logger.error(f"Error in fetch operation: {e}")
+            raise
+
+    def get(self, start_time: str, end_time: str) -> str:
+        """Get data for a specific time range and save to a new CSV file."""
+        try:
+            start_ts = self._parse_timestamp(start_time)
+            end_ts = self._parse_timestamp(end_time)
+            
+            if not Path(self.base_file).exists():
+                raise FileNotFoundError(f"Base file {self.base_file} not found. Please run fetch first.")
+            
+            df = pd.read_csv(self.base_file)
+            df['timestamp'] = df['timestamp'].astype(int)
+            
+            mask = (df['timestamp'] >= start_ts) & (df['timestamp'] <= end_ts)
+            filtered_df = df[mask]
+            
+            if filtered_df.empty:
+                raise ValueError(f"No data found for the specified time range: {start_time} to {end_time}")
+            
+            output_file = f"dataset_daily_{start_time}--{end_time}.csv"
+            filtered_df.to_csv(output_file, index=False)
+            logger.info(f"Successfully created {output_file} with {len(filtered_df)} records")
+            
+            return output_file
+            
+        except Exception as e:
+            logger.error(f"Error in get operation: {e}")
+            raise
 
 if __name__ == "__main__":
-    logger.info("="*70)
-    logger.info("АВТОМАТИЧЕСКАЯ ЗАГРУЗКА ДАННЫХ ПО ФЬЮЧЕРСАМ BYBIT")
-    logger.info("="*70)
-    logger.info(f"Символ: {SYMBOL}")
-    logger.info(f"Категория: {CATEGORY}")
-    logger.info(f"Начальная дата: {START_DATE}")
-    logger.info(f"Интервал Open Interest: {OI_INTERVAL}")
-    logger.info("="*70)
-    
-    try:
-        downloader = BybitFuturesDataDownloader(symbol=SYMBOL, category=CATEGORY)
-        
-        # Загружаем Open Interest
-        logger.info("\n[1/2] Загрузка Open Interest...")
-        logger.info("-"*70)
-        oi_df = downloader.download_open_interest(START_DATE, OI_INTERVAL)
-        
-        # Загружаем Funding Rate
-        logger.info("\n[2/2] Загрузка Funding Rate...")
-        logger.info("-"*70)
-        fr_df = downloader.download_funding_rate(START_DATE)
-        
-        # Объединяем данные в один DataFrame
-        logger.info("\n[3/3] Объединение данных...")
-        logger.info("-"*70)
-        
-        if not oi_df.empty and not fr_df.empty:
-            # Объединяем по timestamp (outer merge сохраняет все записи)
-            combined_df = pd.merge(
-                oi_df, 
-                fr_df, 
-                on='timestamp', 
-                how='outer'
-            )
-            combined_df = combined_df.sort_values('timestamp')
-            
-            # Forward fill для funding_rate (заполняем пропуски предыдущим значением)
-            combined_df['funding_rate'] = combined_df['funding_rate'].fillna(method='ffill')
-            
-            # Убираем строки где open_interest пустой (оставляем только интервалы OI)
-            combined_df = combined_df.dropna(subset=['open_interest'])
-            
-        elif not oi_df.empty:
-            combined_df = oi_df.copy()
-            combined_df['funding_rate'] = None
-            
-        elif not fr_df.empty:
-            combined_df = fr_df.copy()
-            combined_df['open_interest'] = None
-            
-        else:
-            logger.error("Не удалось загрузить данные")
-            raise Exception("Нет данных для сохранения")
-        
-        # Сохраняем в один файл
-        start_str = START_DATE.replace(':', '')
-        end_str = datetime.datetime.now().strftime('%d%m%Y%H%M')
-        output_file = f"futures_data_{SYMBOL}_{start_str}-{end_str}.csv"
-        
-        combined_df.to_csv(output_file, index=False)
-        
-        # Итоговая информация
-        logger.info("\n" + "="*70)
-        logger.info("✓ ЗАГРУЗКА УСПЕШНО ЗАВЕРШЕНА")
-        logger.info("="*70)
-        logger.info(f"Файл: {output_file}")
-        logger.info(f"Всего записей: {len(combined_df)}")
-        logger.info(f"Open Interest записей: {combined_df['open_interest'].notna().sum()}")
-        logger.info(f"Funding Rate записей: {combined_df['funding_rate'].notna().sum()}")
-        logger.info("="*70)
-        
-        # Показываем превью данных
-        logger.info("\nПервые 10 записей:")
-        print(combined_df.head(10).to_string(index=False))
-        
-        logger.info("\nПоследние 5 записей:")
-        print(combined_df.tail(5).to_string(index=False))
-        
-    except KeyboardInterrupt:
-        logger.info("\n\n⚠ Прервано пользователем")
-    except Exception as e:
-        logger.error(f"\n\n❌ Критическая ошибка: {e}")
-        raise
+    parser = argparse.ArgumentParser(description='ByBit Daily BTC/USDT Data Manager')
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+
+    fetch_parser = subparsers.add_parser('fetch', help='Fetch new daily data from ByBit')
+    get_parser = subparsers.add_parser('get', help='Get daily data for a specific time range')
+    get_parser.add_argument('start_time', help='Start time in DDMMYYYY:HHMM format')
+    get_parser.add_argument('end_time', help='End time in DDMMYYYY:HHMM format')
+
+    args = parser.parse_args()
+
+    manager = ByBitDataManager()
+
+    if args.command == 'fetch':
+        try:
+            manager.fetch()
+        except Exception as e:
+            logger.error(f"Failed to fetch data: {e}")
+            sys.exit(1)
+    elif args.command == 'get':
+        try:
+            output_file = manager.get(args.start_time, args.end_time)
+            print(f"Data saved to: {output_file}")
+        except Exception as e:
+            logger.error(f"Failed to get data: {e}")
+            sys.exit(1)
+    else:
+        parser.print_help()
+        sys.exit(1)
