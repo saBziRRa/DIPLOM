@@ -11,7 +11,7 @@ def download_and_compute_technical_indicators(symbols=['BTCUSDT', 'ETHUSDT'],
     session = HTTP(testnet=False, api_key=None, api_secret=None)
     all_data = []
     for symbol in symbols:
-        print(f"📊 Обрабатываю {symbol}...")
+        print(f"Обработка {symbol}...")
         
         # kline данные (OHLCV)
         try:
