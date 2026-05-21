@@ -989,4 +989,4 @@ if __name__ == "__main__":
     print(f"\nИтого признаков: {len(feature_cols)}")
     print("\nСписок признаков:")
     for i, f in enumerate(feature_cols, 1):
-        print(f"  {i:3d}. {f}")
+        print(f"  {i:3d}. {f}") 
