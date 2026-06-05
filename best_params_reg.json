@@ -1,0 +1,529 @@
+{
+  "_meta": {
+    "created": "2026-05-23T03:07:39",
+    "budget": "light",
+    "n_trials_per_combo": 40,
+    "gate_objective": "auc",
+    "dir_objective": "mae",
+    "gate_models": [
+      "xgb",
+      "lgbm",
+      "cat"
+    ],
+    "reg_models": [
+      "xgb_huber",
+      "lgbm_huber",
+      "hgb_mae",
+      "elasticnet"
+    ],
+    "models_gate_run": [
+      "xgb",
+      "lgbm",
+      "cat"
+    ],
+    "models_reg_run": [
+      "xgb_huber",
+      "lgbm_huber",
+      "hgb_mae",
+      "elasticnet"
+    ],
+    "training_target": "t_static",
+    "note": "v8: gate(AUC) + reg_all(MAE, \u0432\u0441\u0435 \u0431\u0430\u0440\u044b) + reg_jump(MAE, \u0442\u043e\u043b\u044c\u043a\u043e \u0441\u043a\u0430\u0447\u043a\u0438 + price_ctx)",
+    "cv": {
+      "type": "purged_walk_forward_embargo",
+      "n_splits": 5,
+      "embargo_1h": 1,
+      "embargo_6h": 6
+    },
+    "total_minutes": 17.5,
+    "previous_created": "2026-05-22T12:50:48"
+  },
+  "results": {
+    "1h": {
+      "t_static": {
+        "dir": {
+          "xgb_huber": {
+            "model": "xgb_huber",
+            "target_metric": "mae",
+            "best_score": 0.0029638575717570695,
+            "best_params": {
+              "huber_slope": 0.044515129224240974,
+              "n_estimators": 383,
+              "max_depth": 6,
+              "learning_rate": 0.005448095059127298,
+              "subsample": 0.5076303635578309,
+              "colsample_bytree": 0.6552050007213028,
+              "min_child_weight": 30,
+              "gamma": 4.980082658737176,
+              "reg_alpha": 8.855443890738393,
+              "reg_lambda": 0.3284080796872459
+            },
+            "all_metrics_at_best": {
+              "mae": 0.0029638575717570695,
+              "rmse": 0.004451927979623389,
+              "sign_acc": 0.4996564540480243
+            },
+            "n_trials": 40,
+            "elapsed_sec": 36.2
+          },
+          "lgbm_huber": {
+            "model": "lgbm_huber",
+            "target_metric": "mae",
+            "best_score": 0.002963867398986934,
+            "best_params": {
+              "alpha": 0.004328450221293881,
+              "n_estimators": 768,
+              "num_leaves": 96,
+              "max_depth": 7,
+              "learning_rate": 0.00850018649460551,
+              "min_data_in_leaf": 19,
+              "subsample": 0.5290418060840998,
+              "subsample_freq": 9,
+              "colsample_bytree": 0.8005575058716043,
+              "reg_alpha": 0.3470266988650412,
+              "reg_lambda": 0.00012674255898937226,
+              "min_gain_to_split": 0.9699098521619943
+            },
+            "all_metrics_at_best": {
+              "mae": 0.002963867398986934,
+              "rmse": 0.00445199558470981,
+              "sign_acc": 0.4996564540480243
+            },
+            "n_trials": 40,
+            "elapsed_sec": 19.6
+          },
+          "hgb_mae": {
+            "model": "hgb_mae",
+            "target_metric": "mae",
+            "best_score": 0.0029573471633400216,
+            "best_params": {
+              "max_iter": 151,
+              "max_depth": 3,
+              "learning_rate": 0.006097062376721139,
+              "min_samples_leaf": 84,
+              "l2_regularization": 0.001623657547942029,
+              "max_leaf_nodes": 77
+            },
+            "all_metrics_at_best": {
+              "mae": 0.0029573471633400216,
+              "rmse": 0.004450624152262814,
+              "sign_acc": 0.5278943445941398
+            },
+            "n_trials": 40,
+            "elapsed_sec": 103.3
+          },
+          "elasticnet": {
+            "model": "elasticnet",
+            "target_metric": "mae",
+            "best_score": 0.002963604948473018,
+            "best_params": {
+              "model__alpha": 0.0001745289489168203,
+              "model__l1_ratio": 0.7605293596875182
+            },
+            "all_metrics_at_best": {
+              "mae": 0.002963604948473018,
+              "rmse": 0.0044529165461834695,
+              "sign_acc": 0.5083836271144063
+            },
+            "n_trials": 40,
+            "elapsed_sec": 5.7
+          }
+        },
+        "gate": {
+          "xgb": {
+            "model": "xgb",
+            "target_metric": "auc",
+            "best_score": 0.7758223641906424,
+            "best_params": {
+              "n_estimators": 459,
+              "max_depth": 9,
+              "learning_rate": 0.00675591473822541,
+              "subsample": 0.5979914312095727,
+              "colsample_bytree": 0.522613644455269,
+              "min_child_weight": 7,
+              "gamma": 1.9433864484474102,
+              "reg_alpha": 0.002273762810253686,
+              "reg_lambda": 1.3921548533046495
+            },
+            "all_metrics_at_best": {
+              "auc": 0.7758223641906424
+            },
+            "n_trials": 40,
+            "elapsed_sec": 132.9
+          },
+          "lgbm": {
+            "model": "lgbm",
+            "target_metric": "auc",
+            "best_score": 0.7738683769945947,
+            "best_params": {
+              "n_estimators": 444,
+              "num_leaves": 76,
+              "max_depth": 11,
+              "learning_rate": 0.009993453276036648,
+              "min_data_in_leaf": 98,
+              "subsample": 0.6715898688987141,
+              "subsample_freq": 9,
+              "colsample_bytree": 0.9134336554829187,
+              "reg_alpha": 0.0023613764673306066,
+              "reg_lambda": 0.0034321391030170505
+            },
+            "all_metrics_at_best": {
+              "auc": 0.7738683769945947
+            },
+            "n_trials": 40,
+            "elapsed_sec": 66.1
+          },
+          "cat": {
+            "model": "cat",
+            "target_metric": "auc",
+            "best_score": 0.7610081827311169,
+            "best_params": {
+              "iterations": 518,
+              "depth": 3,
+              "learning_rate": 0.011971972126376757,
+              "l2_leaf_reg": 0.008957434792999883,
+              "border_count": 181,
+              "random_strength": 1.2687588116577269
+            },
+            "all_metrics_at_best": {
+              "auc": 0.7610081827311169
+            },
+            "n_trials": 40,
+            "elapsed_sec": 233.5
+          }
+        },
+        "dir_jump": {
+          "xgb_huber": {
+            "model": "xgb_huber",
+            "target_metric": "mae",
+            "best_score": 0.012719690067265619,
+            "best_params": {
+              "huber_slope": 0.0026203435522513014,
+              "n_estimators": 505,
+              "max_depth": 4,
+              "learning_rate": 0.008890039586185634,
+              "subsample": 0.9068650856729252,
+              "colsample_bytree": 0.8660239983929684,
+              "min_child_weight": 14,
+              "gamma": 3.218772045458777,
+              "reg_alpha": 0.00033715105391439367,
+              "reg_lambda": 0.0017893014057872576
+            },
+            "all_metrics_at_best": {
+              "mae": 0.012719690067265619,
+              "rmse": 0.014807740211725198,
+              "sign_acc": 0.5155844155844156
+            },
+            "n_trials": 40,
+            "elapsed_sec": 27.8
+          },
+          "lgbm_huber": {
+            "model": "lgbm_huber",
+            "target_metric": "mae",
+            "best_score": 0.012805819716763834,
+            "best_params": {
+              "alpha": 0.004328450221293881,
+              "n_estimators": 768,
+              "num_leaves": 96,
+              "max_depth": 7,
+              "learning_rate": 0.00850018649460551,
+              "min_data_in_leaf": 19,
+              "subsample": 0.5290418060840998,
+              "subsample_freq": 9,
+              "colsample_bytree": 0.8005575058716043,
+              "reg_alpha": 0.3470266988650412,
+              "reg_lambda": 0.00012674255898937226,
+              "min_gain_to_split": 0.9699098521619943
+            },
+            "all_metrics_at_best": {
+              "mae": 0.012805819716763834,
+              "rmse": 0.0139303534713943,
+              "sign_acc": 0.5155844155844156
+            },
+            "n_trials": 40,
+            "elapsed_sec": 6.5
+          },
+          "hgb_mae": {
+            "model": "hgb_mae",
+            "target_metric": "mae",
+            "best_score": 0.012480571486172676,
+            "best_params": {
+              "max_iter": 446,
+              "max_depth": 3,
+              "learning_rate": 0.006238197136284725,
+              "min_samples_leaf": 143,
+              "l2_regularization": 6.732248920775331,
+              "max_leaf_nodes": 106
+            },
+            "all_metrics_at_best": {
+              "mae": 0.012480571486172676,
+              "rmse": 0.01566579534600888,
+              "sign_acc": 0.5285714285714285
+            },
+            "n_trials": 40,
+            "elapsed_sec": 53.1
+          },
+          "elasticnet": {
+            "model": "elasticnet",
+            "target_metric": "mae",
+            "best_score": 0.012805819716442676,
+            "best_params": {
+              "model__alpha": 0.0457056309980145,
+              "model__l1_ratio": 0.588792635777333
+            },
+            "all_metrics_at_best": {
+              "mae": 0.012805819716442676,
+              "rmse": 0.013930353470430774,
+              "sign_acc": 0.5155844155844156
+            },
+            "n_trials": 40,
+            "elapsed_sec": 0.9
+          }
+        }
+      }
+    },
+    "6h": {
+      "t_static": {
+        "dir": {
+          "xgb_huber": {
+            "model": "xgb_huber",
+            "target_metric": "mae",
+            "best_score": 0.007479063739823608,
+            "best_params": {
+              "huber_slope": 0.0013937109211249995,
+              "n_estimators": 739,
+              "max_depth": 3,
+              "learning_rate": 0.07101984135989631,
+              "subsample": 0.658300681224057,
+              "colsample_bytree": 0.8544629799913469,
+              "min_child_weight": 10,
+              "gamma": 0.9676810711436181,
+              "reg_alpha": 0.00010870087773946064,
+              "reg_lambda": 0.0026834201343478963
+            },
+            "all_metrics_at_best": {
+              "mae": 0.007479063739823608,
+              "rmse": 0.010910061175603843,
+              "sign_acc": 0.4947058823529412
+            },
+            "n_trials": 40,
+            "elapsed_sec": 35.5
+          },
+          "lgbm_huber": {
+            "model": "lgbm_huber",
+            "target_metric": "mae",
+            "best_score": 0.0074794777124167575,
+            "best_params": {
+              "alpha": 0.004328450221293881,
+              "n_estimators": 768,
+              "num_leaves": 96,
+              "max_depth": 7,
+              "learning_rate": 0.00850018649460551,
+              "min_data_in_leaf": 19,
+              "subsample": 0.5290418060840998,
+              "subsample_freq": 9,
+              "colsample_bytree": 0.8005575058716043,
+              "reg_alpha": 0.3470266988650412,
+              "reg_lambda": 0.00012674255898937226,
+              "min_gain_to_split": 0.9699098521619943
+            },
+            "all_metrics_at_best": {
+              "mae": 0.0074794777124167575,
+              "rmse": 0.010914306845346316,
+              "sign_acc": 0.4947058823529412
+            },
+            "n_trials": 40,
+            "elapsed_sec": 8.2
+          },
+          "hgb_mae": {
+            "model": "hgb_mae",
+            "target_metric": "mae",
+            "best_score": 0.007499662739468891,
+            "best_params": {
+              "max_iter": 165,
+              "max_depth": null,
+              "learning_rate": 0.007034171877593593,
+              "min_samples_leaf": 145,
+              "l2_regularization": 0.00015270110960189577,
+              "max_leaf_nodes": 67
+            },
+            "all_metrics_at_best": {
+              "mae": 0.007499662739468891,
+              "rmse": 0.01093872813638709,
+              "sign_acc": 0.5117647058823529
+            },
+            "n_trials": 40,
+            "elapsed_sec": 60.9
+          },
+          "elasticnet": {
+            "model": "elasticnet",
+            "target_metric": "mae",
+            "best_score": 0.007478790849158777,
+            "best_params": {
+              "model__alpha": 0.00211896652080126,
+              "model__l1_ratio": 0.8884783493780548
+            },
+            "all_metrics_at_best": {
+              "mae": 0.007478790849158777,
+              "rmse": 0.0109138129628566,
+              "sign_acc": 0.4947058823529412
+            },
+            "n_trials": 40,
+            "elapsed_sec": 1.0
+          }
+        },
+        "gate": {
+          "xgb": {
+            "model": "xgb",
+            "target_metric": "auc",
+            "best_score": 0.6467222037651857,
+            "best_params": {
+              "n_estimators": 369,
+              "max_depth": 3,
+              "learning_rate": 0.005028032612296563,
+              "subsample": 0.7441459392583694,
+              "colsample_bytree": 0.5642172125113806,
+              "min_child_weight": 10,
+              "gamma": 0.5675986853847985,
+              "reg_alpha": 0.003797162380239706,
+              "reg_lambda": 0.11265148746749364
+            },
+            "all_metrics_at_best": {
+              "auc": 0.6467222037651857
+            },
+            "n_trials": 40,
+            "elapsed_sec": 64.7
+          },
+          "lgbm": {
+            "model": "lgbm",
+            "target_metric": "auc",
+            "best_score": 0.6524093013581778,
+            "best_params": {
+              "n_estimators": 100,
+              "num_leaves": 11,
+              "max_depth": 11,
+              "learning_rate": 0.010406323022783525,
+              "min_data_in_leaf": 19,
+              "subsample": 0.5810266352402632,
+              "subsample_freq": 6,
+              "colsample_bytree": 0.6627952401611431,
+              "reg_alpha": 0.0151530190027151,
+              "reg_lambda": 0.08557164309344815
+            },
+            "all_metrics_at_best": {
+              "auc": 0.6524093013581778
+            },
+            "n_trials": 40,
+            "elapsed_sec": 22.3
+          },
+          "cat": {
+            "model": "cat",
+            "target_metric": "auc",
+            "best_score": 0.6644827043387116,
+            "best_params": {
+              "iterations": 201,
+              "depth": 5,
+              "learning_rate": 0.007916691952612173,
+              "l2_leaf_reg": 0.07265271597833994,
+              "border_count": 58,
+              "random_strength": 7.518432899129778
+            },
+            "all_metrics_at_best": {
+              "auc": 0.6644827043387116
+            },
+            "n_trials": 40,
+            "elapsed_sec": 120.5
+          }
+        },
+        "dir_jump": {
+          "xgb_huber": {
+            "model": "xgb_huber",
+            "target_metric": "mae",
+            "best_score": 0.02363107541906482,
+            "best_params": {
+              "huber_slope": 0.00641135794353046,
+              "n_estimators": 795,
+              "max_depth": 6,
+              "learning_rate": 0.00791541880627189,
+              "subsample": 0.8226407812989849,
+              "colsample_bytree": 0.614389637535034,
+              "min_child_weight": 18,
+              "gamma": 2.336795567725446,
+              "reg_alpha": 0.019636981575394633,
+              "reg_lambda": 0.0028654199062012023
+            },
+            "all_metrics_at_best": {
+              "mae": 0.02363107541906482,
+              "rmse": 0.026317983859697844,
+              "sign_acc": 0.485
+            },
+            "n_trials": 40,
+            "elapsed_sec": 19.2
+          },
+          "lgbm_huber": {
+            "model": "lgbm_huber",
+            "target_metric": "mae",
+            "best_score": 0.02368925697912177,
+            "best_params": {
+              "alpha": 0.004328450221293881,
+              "n_estimators": 768,
+              "num_leaves": 96,
+              "max_depth": 7,
+              "learning_rate": 0.00850018649460551,
+              "min_data_in_leaf": 19,
+              "subsample": 0.5290418060840998,
+              "subsample_freq": 9,
+              "colsample_bytree": 0.8005575058716043,
+              "reg_alpha": 0.3470266988650412,
+              "reg_lambda": 0.00012674255898937226,
+              "min_gain_to_split": 0.9699098521619943
+            },
+            "all_metrics_at_best": {
+              "mae": 0.02368925697912177,
+              "rmse": 0.025259351339447747,
+              "sign_acc": 0.485
+            },
+            "n_trials": 40,
+            "elapsed_sec": 3.9
+          },
+          "hgb_mae": {
+            "model": "hgb_mae",
+            "target_metric": "mae",
+            "best_score": 0.02201678892593919,
+            "best_params": {
+              "max_iter": 190,
+              "max_depth": 4,
+              "learning_rate": 0.008332130361129675,
+              "min_samples_leaf": 43,
+              "l2_regularization": 1.8591371816059965,
+              "max_leaf_nodes": 28
+            },
+            "all_metrics_at_best": {
+              "mae": 0.02201678892593919,
+              "rmse": 0.02670641036919573,
+              "sign_acc": 0.58
+            },
+            "n_trials": 40,
+            "elapsed_sec": 25.8
+          },
+          "elasticnet": {
+            "model": "elasticnet",
+            "target_metric": "mae",
+            "best_score": 0.023657982393098784,
+            "best_params": {
+              "model__alpha": 0.010129197956845729,
+              "model__l1_ratio": 0.6872653200164409
+            },
+            "all_metrics_at_best": {
+              "mae": 0.023657982393098784,
+              "rmse": 0.02524080672438733,
+              "sign_acc": 0.495
+            },
+            "n_trials": 40,
+            "elapsed_sec": 0.7
+          }
+        }
+      }
+    }
+  }
+}
