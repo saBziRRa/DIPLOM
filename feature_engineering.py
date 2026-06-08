@@ -1,42 +1,27 @@
 """
-feature_engineering.py - Построение признаков для классификации скачков BTC
+feature_engineering.py — Построение признаков для классификации скачков BTC.
 
 Принимает на вход dict из data_loader.load_all().
 Мастер-индекс: 1H свечи (candles_1h).
 Возвращает готовый DataFrame с признаками и таргетами.
 
-Таргеты:
-    target_1h : скачок цены через 1 бар (1H) на +/-0.8%  -> (-1, 0, 1)
-    target_6h : скачок цены через 6 баров (6H) на +/-2% -> (-1, 0, 1)
-    Пороги по умолчанию: 1% (1H) и 2% (6H).
-
-Пересчёт rolling-окон относительно 4H версии (×4 баров):
-    Период   4H-баров   1H-баров
-    ──────   ────────   ────────
-    1 день       6         24
-    4 дня       24         96
-    7 дней      42        168
-    28 дней    168        672
-    200 дней  1200       4800
-
-Использование (вариант 1 - через data_loader):
-    from data_loader import load_all, START_DATE
-    from feature_engineering import build_features
-
-    data = load_all(start_date=START_DATE)
-    df, feature_cols = build_features(data, threshold_1h=0.008, threshold_6h=0.02)
-
-Использование (вариант 2 - из сохранённых CSV, без API):
-    from feature_engineering import load_from_csv, build_features
-
-    data = load_from_csv(csv_dir=".", prefix="btc")
-    df, feature_cols = build_features(data, threshold_1h=0.008, threshold_6h=0.02)
+Таргеты строятся тройным барьером (Triple Barrier Method).
+Параметры таргетов настраиваются независимо для каждого горизонта:
+    - num_bars : вертикальный горизонт в барах
+    - span     : период EWMA для волатильности
+    - pt_sl    : (тейк-профит, стоп-лосс) в сигмах
+    - min_target : минимальная прогнозная волатильность
 """
+
+from __future__ import annotations
 
 import glob
 import logging
 import os
+import re
 import warnings
+from datetime import datetime, timedelta
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -51,47 +36,215 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _rsi(series, period=14):
+WARMUP_DAYS = 210
+RECOMMENDED_DAYS_1H = 90
+RECOMMENDED_DAYS_6H = 365
+
+FORCE_DROP_6H: List[str] = [
+    "ret_lag_1",
+    "ret_lag_2",
+    "ret_lag_3",
+    "rsi_lag_1",
+    "rsi_lag_2",
+    "rsi_lag_3",
+    "funding_lag_8h",
+    "funding_lag_16h",
+    "session_asia",
+    "session_europe",
+    "session_ny",
+    "session_overlap",
+    "dayofweek",
+]
+
+_PRICE_RE = re.compile(
+    r"close|open|high|low|sma|ratio|vix|yield|spread|gold|oil|tlt|ief"
+    r"|sp500|nasdaq|dxy|btc_spy|open_interest|fear_greed|turnover|volume"
+    r"|move_index"
+)
+_PCT_RE = re.compile(
+    r"pct|log_return|volatility|funding_rate|risk_regime|ls_ratio"
+    r"|ls_buy|ls_sell|move_pct|news"
+)
+_CORR_RE = re.compile(r"corr")
+
+# Тройной барьер
+
+def ewma_volatility(close: pd.Series, span: int = 72) -> pd.Series:
+    """Экспоненциально взвешенная волатильность лог-доходностей."""
+    log_ret = np.log(close).diff()
+    return log_ret.ewm(span=span).std()
+
+
+def barrier_target(
+    close: pd.Series, num_bars: int, span: int = 72
+) -> pd.Series:
+    """Прогнозная волатильность на горизонт num_bars баров."""
+    vol = ewma_volatility(close, span=span)
+    return vol * np.sqrt(num_bars)
+
+
+def get_events(
+    close: pd.Series,
+    events_index: pd.Index,
+    num_bars: int,
+    pt_sl: tuple[float, float],
+    target: pd.Series,
+    min_target: float = 0.0,
+    side: pd.Series | None = None,
+) -> pd.DataFrame:
+    """
+    Генерирует события тройного барьера.
+
+    Возвращает DataFrame с колонками:
+        t1    : время выхода (индекс бара)
+        trgt  : уровень барьера
+        side  : направление ставки (по умолчанию 1)
+        ret   : реализованная доходность
+        touch : -1 (нижний), 0 (вертикальный), +1 (верхний)
+    """
+    bar_index = close.index
+    close_values = close.to_numpy(dtype=float)
+    target = target.reindex(events_index).dropna()
+    target = target[target > min_target]
+    idx = target.index
+    start_pos = bar_index.get_indexer(idx)
+    keep = start_pos >= 0
+    idx = idx[keep]
+    start_pos = start_pos[keep]
+    target = target.loc[idx]
+
+    if side is None:
+        side_arr = np.ones(len(idx))
+        pt_mult = sl_mult = pt_sl[0]
+    else:
+        side_arr = side.reindex(idx).to_numpy(dtype=float)
+        pt_mult, sl_mult = pt_sl
+
+    trgt_arr = target.to_numpy(dtype=float)
+    n_bars = bar_index.shape[0]
+    t1_pos = np.empty(len(idx), dtype=int)
+    touch = np.zeros(len(idx), dtype=int)
+
+    for i, sp in enumerate(start_pos):
+        end = min(sp + num_bars, n_bars - 1)
+        entry = close_values[sp]
+        s = side_arr[i]
+        pt = pt_mult * trgt_arr[i]
+        sl = sl_mult * trgt_arr[i]
+        hit = end
+        kind = 0
+        for j in range(sp + 1, end + 1):
+            ret = (close_values[j] / entry - 1.0) * s
+            if pt_mult > 0 and ret >= pt:
+                hit, kind = j, 1
+                break
+            if sl_mult > 0 and ret <= -sl:
+                hit, kind = j, -1
+                break
+        t1_pos[i] = hit
+        touch[i] = kind
+
+    events = pd.DataFrame(index=idx)
+    events["t1"] = bar_index[t1_pos]
+    events["trgt"] = trgt_arr
+    events["side"] = side_arr
+    events["ret"] = close_values[t1_pos] / close_values[start_pos] - 1.0
+    events["touch"] = touch
+    return events
+
+
+def primary_labels(events: pd.DataFrame) -> pd.Series:
+    """Знак доходности (только для ненулевых)."""
+    labels = np.sign(events["ret"])
+    labels = labels[labels != 0]
+    return labels.astype(int)
+
+
+def meta_labels(events: pd.DataFrame, side: pd.Series) -> pd.Series:
+    """Прибыльность сделки с учётом стороны."""
+    idx = side.dropna().index.intersection(events.index)
+    profit = side.loc[idx] * events.loc[idx, "ret"] > 0
+    return profit.astype(int)
+
+
+def num_concurrent_events(
+    bar_index: pd.Index, events: pd.DataFrame
+) -> pd.Series:
+    """Количество одновременных событий для каждого бара."""
+    count = pd.Series(0, index=bar_index)
+    start_pos = bar_index.get_indexer(events.index)
+    end_pos = bar_index.get_indexer(pd.DatetimeIndex(events["t1"]))
+    for sp, ep in zip(start_pos, end_pos):
+        if sp < 0 or ep < 0:
+            continue
+        count.iloc[sp : ep + 1] += 1
+    return count
+
+
+def average_uniqueness(
+    bar_index: pd.Index, events: pd.DataFrame
+) -> pd.Series:
+    """Средняя уникальность каждого события."""
+    count = num_concurrent_events(bar_index, events).to_numpy(dtype=float)
+    inv = np.divide(1.0, count, out=np.zeros_like(count), where=count > 0)
+    start_pos = bar_index.get_indexer(events.index)
+    end_pos = bar_index.get_indexer(pd.DatetimeIndex(events["t1"]))
+    weight = np.ones(len(events))
+    for i, (sp, ep) in enumerate(zip(start_pos, end_pos)):
+        if sp < 0 or ep < 0 or ep < sp:
+            continue
+        segment = inv[sp : ep + 1]
+        if segment.size:
+            weight[i] = segment.mean()
+    return pd.Series(weight, index=events.index)
+
+
+# Технические индикаторы
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Relative Strength Index."""
     delta = series.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    gain = delta.clip(lower=0).rolling(period, min_periods=1).mean()
+    loss = (-delta.clip(upper=0)).rolling(period, min_periods=1).mean()
     rs = gain / loss.replace(0, np.nan)
     return 100 - 100 / (1 + rs)
 
 
-def _ema(series, span):
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    """Exponential Moving Average."""
     return series.ewm(span=span, adjust=False).mean()
 
 
-def _atr(high, low, close, period=14):
-    tr = pd.concat([
-        high - low,
-        (high - close.shift(1)).abs(),
-        (low - close.shift(1)).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+def _atr(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> pd.Series:
+    """Average True Range."""
+    prev_close = close.shift(1)
+    tr = np.maximum(
+        np.maximum(high - low, (high - prev_close).abs()),
+        (low - prev_close).abs(),
+    )
+    return pd.Series(tr, index=close.index).rolling(
+        period, min_periods=1
+    ).mean()
 
 
-def _zscore(series, window, min_periods=1):
+def _zscore(
+    series: pd.Series, window: int, min_periods: int = 1
+) -> pd.Series:
+    """Z-score нормализация с rolling-окном."""
     mean = series.rolling(window, min_periods=min_periods).mean()
-    std = series.rolling(window, min_periods=min_periods).std().replace(0, np.nan)
-    return (series - mean) / std
+    std = (
+        series.rolling(window, min_periods=min_periods)
+        .std()
+        .replace(0, np.nan)
+    )
+    return ((series - mean) / std).fillna(0)
 
 
-def _merge_sources(data):
-    """
-    Собирает все источники в единый DataFrame на мастер-индексе candles_1h.
+# Объединение источников
 
-    Префиксы колонок:
-        c_   - 1H свечи (candles_1h)
-        d_   - дневные свечи (bybit_daily)
-        m_   - макро (macro)
-        fg_  - Fear & Greed (fear_greed)
-        oi_  - Open Interest
-        fr_  - Funding Rate
-        ls_  - Long/Short Ratio
-        oc_  - On-chain метрики (onchain, strip "onchain_" из имён колонок)
-    """
+def _merge_sources(data: dict) -> pd.DataFrame:
+    """Объединяет все источники на мастер-индексе 1H."""
     candles = data.get("candles_1h", pd.DataFrame())
     if candles.empty:
         raise ValueError("candles_1h пуст — нет мастер-индекса")
@@ -99,218 +252,190 @@ def _merge_sources(data):
     df = candles.copy()
     df.columns = [f"c_{c.lower()}" for c in df.columns]
 
-
-    onchain_raw = data.get("onchain", pd.DataFrame())
-    if not onchain_raw.empty:
-        onchain_raw = onchain_raw.copy()
-        onchain_raw.columns = [
-            c.replace("onchain_", "") for c in onchain_raw.columns
-        ]
-
     sources = {
-        "d":  data.get("bybit_daily",   pd.DataFrame()),
-        "m":  data.get("macro",         pd.DataFrame()),
-        "fg": data.get("fear_greed",    pd.DataFrame()),
+        "d": data.get("bybit_daily", pd.DataFrame()),
+        "m": data.get("macro", pd.DataFrame()),
+        "fg": data.get("fear_greed", pd.DataFrame()),
         "oi": data.get("open_interest", pd.DataFrame()),
-        "fr": data.get("funding_rate",  pd.DataFrame()),
-        "ls": data.get("long_short",    pd.DataFrame()),
-        "oc": onchain_raw,
+        "fr": data.get("funding_rate", pd.DataFrame()),
+        "ls": data.get("long_short", pd.DataFrame()),
     }
 
     for prefix, src in sources.items():
         if src.empty:
-            logger.warning(f"Источник '{prefix}' пуст, пропускаем")
+            logger.warning("Источник '%s' пуст, пропускаем", prefix)
             continue
         src = src.copy()
         src.columns = [f"{prefix}_{c}" for c in src.columns]
         df = df.join(src, how="left")
 
+    sentiment = data.get("sentiment", pd.DataFrame())
+    if not sentiment.empty:
+        df = df.join(sentiment, how="left")
+    else:
+        logger.warning("Источник 'sentiment' пуст, пропускаем")
+
     logger.info(
-        f"Объединено: {len(df)} строк, "
-        f"{len(df.columns)} исходных колонок"
+        "Объединено: %d строк, %d исходных колонок",
+        len(df),
+        len(df.columns),
     )
     return df
 
 
-def _handle_missing(df):
-    price_patterns = [
-        "close","open","high","low","sma","ratio","vix","yield","spread",
-        "gold","oil","tlt","ief","sp500","nasdaq","dxy","btc_spy","open_interest",
-        "fear_greed","turnover","volume","move_index","hash_rate","tx_volume",
-        "oc_"
-    ]
-    pct_patterns = [
-        "pct","log_return","volatility","funding_rate","risk_regime","ls_ratio",
-        "ls_buy","ls_sell","move_pct","tx_count_pct","hash_rate_pct","mempool_pct",
-        "fees_usd", "oc_"
-    ]
-    corr_patterns = ["corr"]
-
+def _handle_missing(df: pd.DataFrame) -> pd.DataFrame:
+    """Заполнение пропусков по типу колонки."""
     for col in df.columns:
         col_l = col.lower()
-        if any(p in col_l for p in corr_patterns):
+        if _CORR_RE.search(col_l):
             df[col] = df[col].ffill().fillna(0)
-        elif any(p in col_l for p in pct_patterns):
+        elif _PCT_RE.search(col_l):
             df[col] = df[col].fillna(0)
-        elif any(p in col_l for p in price_patterns):
+        elif _PRICE_RE.search(col_l):
             df[col] = df[col].ffill()
 
     df = df.dropna(subset=["c_close"])
+
+    remaining_nan_cols = [c for c in df.columns if df[c].isna().any()]
+    if remaining_nan_cols:
+        for col in remaining_nan_cols:
+            df[col] = df[col].ffill().fillna(0)
+        logger.info(
+            "Финальный fillna: обработано %d колонок с NaN: %s",
+            len(remaining_nan_cols),
+            remaining_nan_cols,
+        )
 
     missing_pct = df.isnull().mean() * 100
     high_missing = missing_pct[missing_pct > 5]
     if not high_missing.empty:
         logger.warning(
-            f"Колонки с >5% пропусков после fillna: "
-            f"{high_missing.round(1).to_dict()}"
+            "Колонки с >5%% пропусков после fillna: %s",
+            high_missing.round(1).to_dict(),
         )
     else:
         logger.info("Пропуски обработаны, критических колонок нет")
 
-    logger.info(f"После обработки пропусков: {len(df)} строк")
+    logger.info("После обработки пропусков: %d строк", len(df))
     return df
 
 
-def _add_technical(df):
-    """
-    RSI: периоды 14H, 24H (1 день), 48H (2 дня).
-    MACD: 12/26/9 (стандартные, таймфрейм-независимые).
-    BB:  24-барная (= 1 день на 1H).
-    ATR: 14H.
-    SMA: 24(1d), 96(4d), 168(7d), 672(28d) баров.
-    Волатильность: 24H, 168H (7d), 672H (28d).
-    """
+def _add_technical(df: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет технические индикаторы."""
     close = df["c_close"]
     high = df["c_high"]
     low = df["c_low"]
 
-    # RSI
     for p in [14, 24, 48]:
         df[f"rsi_{p}"] = _rsi(close, p)
 
-    # MACD
     macd_line = _ema(close, 12) - _ema(close, 26)
     macd_signal = _ema(macd_line, 9)
     df["macd"] = macd_line
     df["macd_hist"] = macd_line - macd_signal
 
-    # Bollinger Bands (24 бара = 1 день)
-    sma24 = close.rolling(24).mean()
-    std24 = close.rolling(24).std()
+    sma24 = close.rolling(24, min_periods=1).mean()
+    std24 = close.rolling(24, min_periods=1).std()
     bb_upper = sma24 + 2 * std24
     bb_lower = sma24 - 2 * std24
     bb_width = (bb_upper - bb_lower) / sma24.replace(0, np.nan)
     df["bb_pos"] = (
         (close - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
-    )
-    df["bb_width"] = bb_width
-    # bb_squeeze: ширина полос ниже 7-дневной нормы
+    ).fillna(0.5)
+    df["bb_width"] = bb_width.fillna(0)
     df["bb_squeeze"] = (
-        bb_width < bb_width.rolling(168).mean()
+        bb_width < bb_width.rolling(168, min_periods=1).mean()
     ).astype(int)
 
-    # ATR (14H)
     atr14 = _atr(high, low, close, 14)
     df["atr_pct"] = atr14 / close
-    df["atr_ratio"] = atr14 / atr14.rolling(168).mean()
+    df["atr_ratio"] = (
+        atr14 / atr14.rolling(168, min_periods=1).mean().replace(0, np.nan)
+    ).fillna(1.0)
 
-    # SMA — 1d/4d/7d/28d (в барах 1H)
     bars = {"1d": 24, "4d": 96, "7d": 168, "28d": 672}
     for label, w in bars.items():
-        df[f"sma_{label}"] = close.rolling(w).mean()
+        df[f"sma_{label}"] = close.rolling(w, min_periods=1).mean()
 
-    df["price_to_sma_1d"]  = close / df["sma_1d"]
-    df["price_to_sma_4d"]  = close / df["sma_4d"]
-    df["price_to_sma_7d"]  = close / df["sma_7d"]
+    df["price_to_sma_1d"] = close / df["sma_1d"]
+    df["price_to_sma_4d"] = close / df["sma_4d"]
+    df["price_to_sma_7d"] = close / df["sma_7d"]
     df["price_to_sma_28d"] = close / df["sma_28d"]
-    df["sma_7d_to_28d"]    = df["sma_7d"] / df["sma_28d"]
+    df["sma_7d_to_28d"] = df["sma_7d"] / df["sma_28d"]
 
-    # Stochastic RSI (по RSI-24, окно 24)
     rsi24 = df["rsi_24"]
-    rsi_min = rsi24.rolling(24).min()
-    rsi_max = rsi24.rolling(24).max()
+    rsi_min = rsi24.rolling(24, min_periods=1).min()
+    rsi_max = rsi24.rolling(24, min_periods=1).max()
     df["stoch_rsi"] = (
         (rsi24 - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan)
-    )
+    ).fillna(0.5)
 
-    # Волатильность логарифмических доходностей
     log_ret = np.log(close / close.shift(1))
-    df["volatility_1d"]  = log_ret.rolling(24).std()
-    df["volatility_7d"]  = log_ret.rolling(168).std()
-    df["volatility_28d"] = log_ret.rolling(672).std()
+    df["volatility_1d"] = log_ret.rolling(24, min_periods=1).std()
+    df["volatility_7d"] = log_ret.rolling(168, min_periods=1).std()
+    df["volatility_28d"] = log_ret.rolling(672, min_periods=1).std()
     df["volatility_regime"] = (
-        df["volatility_7d"] / df["volatility_28d"]
-    )
+        df["volatility_7d"] / df["volatility_28d"].replace(0, np.nan)
+    ).fillna(1.0)
 
-    # Удаляем промежуточные SMA-колонки
     df = df.drop(columns=["sma_1d", "sma_4d", "sma_7d", "sma_28d"])
-
     logger.info("Технические индикаторы добавлены")
     return df
 
 
-def _add_volume_features(df):
-    """
-    volume_ratio     : объём vs 7-дневная норма (168 баров).
-    volume_spike     : флаг объёма > 2× нормы.
-    vwap_dist        : отклонение цены от 1-дневного VWAP.
-    vol_price_divergence: направление объёма vs цены.
-    d_turnover_ratio : дневной оборот vs 30-дневная норма.
-
-    Taker volume (новые признаки из candles_1h):
-    taker_buy_zscore  : z-score taker_buy_vol vs 168-барная норма.
-    taker_sell_zscore : z-score taker_sell_vol vs 168-барная норма.
-    taker_vol_ratio_ma: скользящее среднее taker_vol_ratio за 24 бара.
-    taker_vol_imbalance: (buy - sell) / (buy + sell) — нормализованный дисбаланс.
-    """
+def _add_volume_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет признаки объёма, VWAP и taker-volume."""
     vol = df["c_volume"]
     close = df["c_close"]
 
-    vol_mean = vol.rolling(168).mean()
-    df["volume_ratio"] = vol / vol_mean.replace(0, np.nan)
+    vol_mean = vol.rolling(168, min_periods=1).mean()
+    df["volume_ratio"] = (vol / vol_mean.replace(0, np.nan)).fillna(1.0)
     df["volume_spike"] = (df["volume_ratio"] > 2.0).astype(int)
 
-    vwap = (close * vol).rolling(24).sum() / vol.rolling(24).sum()
-    df["vwap_dist"] = (close - vwap) / vwap.replace(0, np.nan)
+    vwap = (
+        (close * vol).rolling(24, min_periods=1).sum()
+        / vol.rolling(24, min_periods=1).sum().replace(0, np.nan)
+    )
+    df["vwap_dist"] = ((close - vwap) / vwap.replace(0, np.nan)).fillna(0)
 
     price_dir = np.sign(close.pct_change())
     vol_dir = np.sign(vol.pct_change())
     df["vol_price_divergence"] = (price_dir != vol_dir).astype(int)
 
     if "d_turnover" in df.columns:
-        d_turn_mean = df["d_turnover"].rolling(30).mean()
+        d_turn_mean = df["d_turnover"].rolling(30, min_periods=1).mean()
         df["d_turnover_ratio"] = (
             df["d_turnover"] / d_turn_mean.replace(0, np.nan)
-        )
+        ).fillna(1.0)
         df["d_turnover_ratio_lag1"] = df["d_turnover_ratio"].shift(1)
-        df["d_turnover_ratio_ma3"]  = (
-            df["d_turnover_ratio"].rolling(3).mean()
+        df["d_turnover_ratio_ma3"] = (
+            df["d_turnover_ratio"].rolling(3, min_periods=1).mean()
         )
 
-    # Taker volume признаки
     if "c_taker_buy_vol" in df.columns and "c_taker_sell_vol" in df.columns:
         buy = df["c_taker_buy_vol"]
         sell = df["c_taker_sell_vol"]
-
-        df["taker_buy_zscore"]  = _zscore(buy, 168)
+        df["taker_buy_zscore"] = _zscore(buy, 168)
         df["taker_sell_zscore"] = _zscore(sell, 168)
-
         total_taker = buy + sell
         df["taker_vol_imbalance"] = (
             (buy - sell) / total_taker.replace(0, np.nan)
-        )
+        ).fillna(0)
 
     if "c_taker_vol_ratio" in df.columns:
         df["taker_vol_ratio_ma"] = (
-            df["c_taker_vol_ratio"].rolling(24).mean()
+            df["c_taker_vol_ratio"].rolling(24, min_periods=1).mean()
         )
-        df["taker_vol_ratio_change"] = df["c_taker_vol_ratio"].diff(6)
+        df["taker_vol_ratio_change"] = (
+            df["c_taker_vol_ratio"].diff(6).fillna(0)
+        )
 
     logger.info("Признаки объёма и taker volume добавлены")
     return df
 
 
-def _add_candle_features(df):
+def _add_candle_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет признаки свечных паттернов."""
     open_ = df["c_open"]
     high = df["c_high"]
     low = df["c_low"]
@@ -320,37 +445,32 @@ def _add_candle_features(df):
     body_abs = body.abs()
     candle_range = (high - low).replace(0, np.nan)
 
-    df["body_ratio"] = body_abs / candle_range
+    df["body_ratio"] = (body_abs / candle_range).fillna(0)
     df["body_dir"] = np.sign(body)
 
-    upper_wick = high - pd.concat([open_, close], axis=1).max(axis=1)
-    lower_wick = (
-        pd.concat([open_, close], axis=1).min(axis=1) - low
-    )
-    df["upper_wick_ratio"] = upper_wick / candle_range
-    df["lower_wick_ratio"] = lower_wick / candle_range
+    oc_max = np.maximum(open_, close)
+    oc_min = np.minimum(open_, close)
+    df["upper_wick_ratio"] = ((high - oc_max) / candle_range).fillna(0)
+    df["lower_wick_ratio"] = ((oc_min - low) / candle_range).fillna(0)
 
-    df["doji"]   = (df["body_ratio"] < 0.1).astype(int)
-    df["hl_pct"] = (high - low) / close
+    df["doji"] = (df["body_ratio"] < 0.1).astype(int)
+    df["hl_pct"] = ((high - low) / close).fillna(0)
 
     logger.info("Свечные паттерны добавлены")
     return df
 
 
-def _add_macro_features(df):
-    """
-    Дневные макро-данные уже выровнены на 1H через ffill в data_loader.
-    Сдвиг pct-колонок на shift(24) = 1 день на 1H-индексе,
-    чтобы исключить lookahead (данные за день T доступны только с T+1).
-    """
+def _add_macro_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет макро-признаки (лаг учтён в data_loader)."""
     close = df["c_close"]
 
     if "m_btc_sma_90d" in df.columns:
-        df["btc_to_macro_sma90"] = close / df["m_btc_sma_90d"]
+        df["btc_to_macro_sma90"] = (
+            close / df["m_btc_sma_90d"].replace(0, np.nan)
+        ).fillna(1.0)
 
-    # 200-дневная SMA на 1H: 200 × 24 = 4800 баров
-    sma200_1h = close.rolling(4800).mean()
-    df["btc_to_sma200_1h"] = close / sma200_1h
+    ema200_1h = close.ewm(span=4800, min_periods=1).mean()
+    df["btc_to_ema200_1h"] = close / ema200_1h
 
     if "m_vix_close" in df.columns:
         df["vix_high"] = (df["m_vix_close"] > 30).astype(int)
@@ -358,55 +478,32 @@ def _add_macro_features(df):
     if "fg_fear_greed_index" in df.columns:
         fg = df["fg_fear_greed_index"]
         df["fg_extreme_fear"] = (fg < 25).astype(int)
-        df["fg_fear"]         = ((fg >= 25) & (fg < 45)).astype(int)
-        df["fg_greed"]        = ((fg >= 55) & (fg < 75)).astype(int)
+        df["fg_fear"] = ((fg >= 25) & (fg < 45)).astype(int)
+        df["fg_greed"] = ((fg >= 55) & (fg < 75)).astype(int)
 
     if "m_tlt_ief_spread" in df.columns:
-        df["yield_spread_change"] = df["m_tlt_ief_spread"].diff()
+        df["yield_spread_change"] = (
+            df["m_tlt_ief_spread"].diff(24).fillna(0)
+        )
 
     if "m_treasury_yield_10y" in df.columns:
         y = df["m_treasury_yield_10y"]
-        df["yield_vs_mean"] = y - y.rolling(60).mean()
+        df["yield_vs_mean"] = (
+            y - y.rolling(1440, min_periods=24).mean()
+        ).fillna(0)
 
-    # Сдвиг всех дневных pct/return/derived колонок на 1 день вперёд (24 бара)
-    m_pct_cols = [
-        c for c in df.columns
-        if c.startswith("m_") and any(
-            c.endswith(s)
-            for s in ["_pct", "_pct_change", "_log_return"]
-        )
-    ]
-    derived_daily_cols = [
-        c for c in [
-            "yield_spread_change", "yield_vs_mean",
-            "m_move_z_score", "m_move_vix_spread",
-        ]
-        if c in df.columns
-    ]
-    daily_pct_cols = m_pct_cols + derived_daily_cols
-    for col in daily_pct_cols:
-        df[col] = df[col].shift(24)
-
-    logger.info(
-        f"Макро признаки добавлены "
-        f"(pct сдвинуты на 24 бара: {len(daily_pct_cols)} колонок)"
-    )
+    logger.info("Макро признаки добавлены (lag учтён в data_loader)")
     return df
 
 
-def _add_futures_features(df):
-    """
-    Open Interest: oi_change_pct (1H), oi_change_6bar (6H),
-                   oi_ratio (vs 7d норма), oi_price_divergence.
-    Funding Rate:  abs, change.
-    L/S Ratio:     buy_ratio, доминирование, скользящее среднее.
-    """
+def _add_futures_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет признаки Open Interest, Funding Rate, Long/Short."""
     if "oi_open_interest" in df.columns:
         oi = df["oi_open_interest"]
-        df["oi_change_pct"]  = oi.pct_change() * 100
-        df["oi_change_6bar"] = oi.pct_change(6) * 100
-        oi_mean = oi.rolling(168).mean()
-        df["oi_ratio"] = oi / oi_mean.replace(0, np.nan)
+        df["oi_change_pct"] = oi.pct_change().fillna(0) * 100
+        df["oi_change_6bar"] = oi.pct_change(6).fillna(0) * 100
+        oi_mean = oi.rolling(168, min_periods=1).mean()
+        df["oi_ratio"] = (oi / oi_mean.replace(0, np.nan)).fillna(1.0)
 
         price_dir = np.sign(df["c_close"].pct_change())
         oi_dir = np.sign(df["oi_change_pct"])
@@ -415,17 +512,23 @@ def _add_futures_features(df):
     if "fr_funding_rate" in df.columns:
         fr = df["fr_funding_rate"].fillna(0)
         df["funding_rate_abs"] = fr.abs()
-        df["funding_change"]   = fr.diff()
+        df["funding_change"] = fr.diff(8).fillna(0)
 
     if "ls_buy_ratio" in df.columns:
         br = df["ls_buy_ratio"].fillna(0.5)
-        df["ls_buy_ratio"]     = br
+        df["ls_buy_ratio"] = br
         df["ls_long_dominant"] = (br > 0.65).astype(int)
-        df["ls_ratio_change"]  = df["ls_ls_ratio"].fillna(1).diff()
-        df["ls_ratio_vs_mean"] = (
-            df["ls_ls_ratio"].fillna(1)
-            / df["ls_ls_ratio"].fillna(1).rolling(42).mean()
-        )
+        if "ls_ls_ratio" in df.columns:
+            ls = df["ls_ls_ratio"].fillna(1)
+            df["ls_ratio_change"] = ls.diff().fillna(0)
+            df["ls_ratio_vs_mean"] = (
+                ls
+                / ls.rolling(42, min_periods=1).mean().replace(0, np.nan)
+            ).fillna(1.0)
+        else:
+            logger.warning(
+                "ls_ls_ratio не найден, пропускаем ratio-признаки"
+            )
     else:
         logger.warning(
             "Long/Short Ratio: данные отсутствуют (ls_buy_ratio не найден)"
@@ -435,294 +538,320 @@ def _add_futures_features(df):
     return df
 
 
-def _add_onchain_features(df):
-    """
-    On-chain метрики из Blockchain.com (дневные, ffill на 1H).
-
-    Исходные колонки после merge (префикс oc_):
-        oc_tx_count, oc_mempool_count, oc_mempool_bytes,
-        oc_hash_rate, oc_fees_usd, oc_tx_volume_usd,
-        oc_fees_per_tx, oc_tx_count_pct, oc_hash_rate_pct,
-        oc_mempool_pct
-
-    Производные признаки:
-        oc_tx_count_zscore    : z-score числа транзакций vs 30d (720 баров)
-        oc_hash_rate_zscore   : z-score хешрейта vs 30d
-        oc_mempool_zscore     : z-score мемпула vs 30d
-        oc_fees_per_tx_zscore : z-score комиссии на транзакцию vs 30d
-        oc_tx_volume_zscore   : z-score объёма переводов vs 30d
-        oc_fees_tx_ratio      : fees_usd / tx_volume_usd — доля комиссий в обороте
-        oc_network_stress     : mempool_zscore × fees_per_tx_zscore — стресс сети
-
-    Сдвиг pct_change-колонок на 24 бара (данные дня T доступны с T+1).
-    """
-    _OC_COLS = {
-        "tx_count":    "oc_tx_count",
-        "mempool":     "oc_mempool_count",
-        "hash_rate":   "oc_hash_rate",
-        "fees_per_tx": "oc_fees_per_tx",
-        "tx_volume":   "oc_tx_volume_usd",
-        "fees_usd":    "oc_fees_usd",
-    }
-
-    present = {k: v for k, v in _OC_COLS.items() if v in df.columns}
-    if not present:
-        logger.warning(
-            "On-chain: данные отсутствуют (oc_* колонки не найдены)"
-        )
-        return df
-
-    # Z-score за 30 дней = 720 баров (дневные данные, ffill  каждый бар одинаков в пределах дня, поэтому используем min_periods=20)
-    _W = 720
-
-    for key, col in present.items():
-        zscore_col = f"oc_{key}_zscore"
-        df[zscore_col] = _zscore(df[col], _W, min_periods=20)
-
-    # Доля комиссий в общем объёме переводов
-    if "oc_fees_usd" in df.columns and "oc_tx_volume_usd" in df.columns:
-        df["oc_fees_tx_ratio"] = (
-            df["oc_fees_usd"]
-            / df["oc_tx_volume_usd"].replace(0, np.nan)
-        )
-
-    # Индикатор перегрузки сети: высокий мемпул + высокие комиссии
-    if "oc_mempool_zscore" in df.columns and "oc_fees_per_tx_zscore" in df.columns:
-        df["oc_network_stress"] = (
-            df["oc_mempool_zscore"] * df["oc_fees_per_tx_zscore"]
-        )
-
-    # Сдвиг pct_change колонок на 1 день (24 бара) — антилуткхед
-    pct_cols = [
-        c for c in df.columns
-        if c.startswith("oc_") and c.endswith("_pct")
-    ]
-    for col in pct_cols:
-        df[col] = df[col].shift(24)
-
-    logger.info(
-        f"On-chain признаки добавлены: "
-        f"{len(present)} базовых метрик, "
-        f"pct сдвинуты на 24 бара"
-    )
-    return df
-
-
-def _add_lags(df):
-    """
-    Лаги логарифмических доходностей: 1H, 2H, 3H, 6H, 12H, 24H.
-    Лаги Funding Rate и RSI: 1H, 2H, 3H.
-    Накопленная доходность: 1 день (24H) и 7 дней (168H).
-    """
-    log_ret = np.log(df["c_close"] / df["c_close"].shift(1))
+def _add_lags(df: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет лаговые признаки."""
+    log_ret = np.log(df["c_close"] / df["c_close"].shift(1)).fillna(0)
 
     for lag in [1, 2, 3, 6, 12, 24]:
-        df[f"ret_lag_{lag}"] = log_ret.shift(lag)
+        df[f"ret_lag_{lag}"] = log_ret.shift(lag).fillna(0)
+
+    if "fr_funding_rate" in df.columns:
+        for lag in [8, 16]:
+            df[f"funding_lag_{lag}h"] = (
+                df["fr_funding_rate"].fillna(0).shift(lag).fillna(0)
+            )
 
     for lag in [1, 2, 3]:
-        if "fr_funding_rate" in df.columns:
-            df[f"funding_lag_{lag}"] = (
-                df["fr_funding_rate"].fillna(0).shift(lag)
-            )
         if "rsi_24" in df.columns:
-            df[f"rsi_lag_{lag}"] = df["rsi_24"].shift(lag)
+            df[f"rsi_lag_{lag}"] = (
+                df["rsi_24"].shift(lag).fillna(50.0)
+            )
 
-    df["cum_ret_1d"] = log_ret.rolling(24).sum().shift(1)
-    df["cum_ret_7d"] = log_ret.rolling(168).sum().shift(1)
+    df["cum_ret_1d"] = (
+        log_ret.rolling(24, min_periods=1).sum().shift(1).fillna(0)
+    )
+    df["cum_ret_7d"] = (
+        log_ret.rolling(168, min_periods=1).sum().shift(1).fillna(0)
+    )
 
     logger.info("Лаговые признаки добавлены")
     return df
 
 
-def _add_time_features(df):
-    """
-    На 1H данных временные признаки намного информативнее, чем на 4H.
-    hour даёт 24 уникальных значения вместо 6.
-    """
+def _add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет временные признаки (час, день недели, сессии)."""
     idx = df.index
 
-    df["hour"]       = idx.hour
-    df["dayofweek"]  = idx.dayofweek
+    df["hour"] = idx.hour
+    df["dayofweek"] = idx.dayofweek
     df["is_weekend"] = (idx.dayofweek >= 5).astype(int)
-    df["month"]      = idx.month
+    df["month"] = idx.month
 
-    # Торговые сессии (UTC)
-    df["session_asia"]    = ((idx.hour >= 0)  & (idx.hour < 8)).astype(int)
-    df["session_europe"]  = ((idx.hour >= 7)  & (idx.hour < 16)).astype(int)
-    df["session_ny"]      = ((idx.hour >= 13) & (idx.hour < 22)).astype(int)
-    # Пересечение EU + NY: наибольший объём
-    df["session_overlap"] = ((idx.hour >= 13) & (idx.hour < 16)).astype(int)
+    df["session_asia"] = ((idx.hour >= 0) & (idx.hour < 8)).astype(int)
+    df["session_europe"] = ((idx.hour >= 7) & (idx.hour < 16)).astype(int)
+    df["session_ny"] = ((idx.hour >= 13) & (idx.hour < 22)).astype(int)
+    df["session_overlap"] = (
+        (idx.hour >= 13) & (idx.hour < 16)
+    ).astype(int)
 
     logger.info("Временные признаки добавлены")
     return df
 
 
-def _add_derived_momentum(df):
-    """
-    rsi_velocity       : скорость изменения RSI за 6 баров (6H).
-    rsi_acceleration   : ускорение RSI (производная velocity за 6 баров).
-    funding_oi_combo   : fr_funding_rate × oi_change_pct.
-    vol_z_score        : (volatility_1d - volatility_28d) / volatility_28d.
-    trend_strength     : |price_to_sma_7d - 1| / volatility_7d.
-    fg_reversal_signal : diff за 24 бара (1 день) по Fear & Greed.
-    vol_price_confirm  : volume_ratio × |ret_lag_1|.
-    ls_acceleration    : скорость изменения ls_buy_ratio за 6 баров.
-    bars_since_big_move: число баров с последнего движения >2σ (макс. 672).
-    """
+def _add_derived_momentum(df: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет производные моментум-признаки."""
     if "rsi_24" in df.columns:
-        df["rsi_velocity"]     = df["rsi_24"].diff(6)
-        df["rsi_acceleration"] = df["rsi_velocity"].diff(6)
+        df["rsi_velocity"] = df["rsi_24"].diff(6).fillna(0)
+        df["rsi_acceleration"] = df["rsi_velocity"].diff(6).fillna(0)
 
     if "fr_funding_rate" in df.columns and "oi_change_pct" in df.columns:
         fr = df["fr_funding_rate"].fillna(0)
         oi = df["oi_change_pct"].fillna(0)
         df["funding_oi_combo"] = fr * oi
 
-    if "volatility_1d" in df.columns and "volatility_28d" in df.columns:
-        vol_norm = df["volatility_28d"].replace(0, np.nan)
-        df["vol_z_score"] = (
-            (df["volatility_1d"] - df["volatility_28d"]) / vol_norm
+    if "volatility_1d" in df.columns and "c_close" in df.columns:
+        log_ret = np.log(df["c_close"] / df["c_close"].shift(1))
+        vol_28d_pure = (
+            log_ret.shift(24).rolling(672, min_periods=48).std()
         )
+        vol_norm = vol_28d_pure.replace(0, np.nan)
+        df["vol_z_score"] = (
+            (df["volatility_1d"] - vol_28d_pure) / vol_norm
+        ).fillna(0)
 
     if "price_to_sma_7d" in df.columns and "volatility_7d" in df.columns:
         vol7 = df["volatility_7d"].replace(0, np.nan)
-        df["trend_strength"] = (df["price_to_sma_7d"] - 1).abs() / vol7
+        df["trend_strength"] = (
+            (df["price_to_sma_7d"] - 1).abs() / vol7
+        ).fillna(0)
 
     if "fg_fear_greed_index" in df.columns:
-        df["fg_reversal_signal"] = df["fg_fear_greed_index"].diff(24)
+        df["fg_reversal_signal"] = (
+            df["fg_fear_greed_index"].diff(24).fillna(0)
+        )
 
     if "volume_ratio" in df.columns and "ret_lag_1" in df.columns:
         df["vol_price_confirm"] = (
             df["volume_ratio"] * df["ret_lag_1"].abs()
-        )
+        ).fillna(0)
 
     if "ls_buy_ratio" in df.columns:
-        df["ls_acceleration"] = df["ls_buy_ratio"].diff(6)
+        df["ls_acceleration"] = df["ls_buy_ratio"].diff(6).fillna(0)
 
     if "ret_lag_1" in df.columns:
         log_ret = df["ret_lag_1"]
-        ret_std = log_ret.rolling(672).std()
-        big_move = (log_ret.abs() > 2 * ret_std).astype(int)
-        counter = []
-        c = 0
-        for v in big_move:
-            if v == 1:
-                c = 0
-            else:
-                c += 1
-            counter.append(c)
-        df["bars_since_big_move"] = counter
-        df["bars_since_big_move"] = df["bars_since_big_move"].clip(upper=672)
+        ret_std = (
+            log_ret.shift(1).rolling(672, min_periods=24).std()
+        )
+        big_move = (
+            (log_ret.abs() > 2 * ret_std).astype(int).fillna(0)
+        )
+        grp = big_move.groupby(big_move.cumsum())
+        df["bars_since_big_move"] = (
+            grp.cumcount().where(big_move == 0, 0).clip(upper=672)
+        )
 
     logger.info("Производные моментум-признаки добавлены")
     return df
 
 
-def _add_targets(df, threshold_1h=0.008, threshold_6h=0.02):
-    """
-    target_1h : движение за 1 бар (1H).  Порог ±1%.
-    target_6h : движение за 6 баров (6H). Порог ±2%.
+def _final_fillna(df: pd.DataFrame) -> pd.DataFrame:
+    """Финальный проход заполнения NaN перед таргетами."""
+    skip_cols = {
+        "c_close",
+        "target_1h",
+        "target_6h",
+        "fwd_ret_1h",
+        "fwd_ret_6h",
+    }
+    nan_before = df.isnull().sum().sum()
 
-    Классы: -1 (падение), 0 (боковик), 1 (рост).
-    """
+    for col in df.columns:
+        if col in skip_cols:
+            continue
+        if df[col].isna().any():
+            df[col] = df[col].ffill().fillna(0)
+
+    nan_after = df.isnull().sum().sum()
+    if nan_before > 0:
+        logger.info(
+            "_final_fillna: устранено %d NaN (осталось %d)",
+            nan_before - nan_after,
+            nan_after,
+        )
+    return df
+
+
+# Новые таргеты через тройной барьер (независимые параметры)
+
+def _compute_labels_for_horizon(
+    close: pd.Series,
+    num_bars: int,
+    span: int,
+    pt_sl: Tuple[float, float],
+    min_target: float,
+) -> pd.DataFrame:
+    """Рассчитывает метки и доходности для заданного горизонта."""
+    target_vol = barrier_target(close, num_bars, span=span)
+    n = len(close)
+    idx_all = close.index
+    touch = pd.Series(0, index=idx_all, dtype=int)
+    ret = pd.Series(np.nan, index=idx_all, dtype=float)
+
+    valid_mask = np.arange(n) + num_bars < n
+    valid_idx = idx_all[valid_mask]
+    ret.loc[valid_idx] = (
+        close.shift(-num_bars).loc[valid_idx] / close.loc[valid_idx] - 1.0
+    )
+
+    event_candidates = valid_idx[target_vol.loc[valid_idx] > min_target]
+    if len(event_candidates) > 0:
+        events = get_events(
+            close,
+            event_candidates,
+            num_bars,
+            pt_sl,
+            target_vol,
+            min_target=0.0,
+            side=None,
+        )
+        touch.loc[events.index] = events["touch"].astype(int)
+        ret.loc[events.index] = events["ret"]
+
+    return pd.DataFrame({"touch": touch, "ret": ret})
+
+
+def _add_triple_barrier_targets(
+    df: pd.DataFrame,
+    num_bars_1h: int = 1,
+    span_1h: int = 72,
+    pt_sl_1h: Tuple[float, float] = (1.0, 1.0),
+    min_target_1h: float = 0.0,
+    num_bars_6h: int = 6,
+    span_6h: int = 72,
+    pt_sl_6h: Tuple[float, float] = (1.0, 1.0),
+    min_target_6h: float = 0.0,
+) -> pd.DataFrame:
+    """Добавляет таргеты для 1H и 6H с независимыми параметрами."""
     close = df["c_close"]
+    labels_1h = _compute_labels_for_horizon(
+        close, num_bars_1h, span_1h, pt_sl_1h, min_target_1h
+    )
+    labels_6h = _compute_labels_for_horizon(
+        close, num_bars_6h, span_6h, pt_sl_6h, min_target_6h
+    )
 
-    future_ret_1h = close.shift(-1) / close - 1
-    future_ret_6h = close.shift(-6) / close - 1
+    df["target_1h"] = labels_1h["touch"]
+    df["fwd_ret_1h"] = labels_1h["ret"]
+    df["target_6h"] = labels_6h["touch"]
+    df["fwd_ret_6h"] = labels_6h["ret"]
 
-    def classify(ret, threshold):
-        labels = pd.Series(0, index=ret.index, dtype=int)
-        labels[ret >  threshold] =  1
-        labels[ret < -threshold] = -1
-        return labels
-
-    df["target_1h"] = classify(future_ret_1h, threshold_1h)
-    df["target_6h"] = classify(future_ret_6h, threshold_6h)
-    df = df.dropna(subset=["target_1h", "target_6h"])
+    df = df.dropna(
+        subset=["target_1h", "target_6h", "fwd_ret_1h", "fwd_ret_6h"]
+    )
 
     logger.info(
-        f"Таргеты 1H (±{threshold_1h * 100:.1f}%): "
-        f"{df['target_1h'].value_counts().sort_index().to_dict()}"
+        "Таргеты 1H (тройной барьер): %s",
+        df["target_1h"].value_counts().sort_index().to_dict(),
     )
     logger.info(
-        f"Таргеты 6H (±{threshold_6h * 100:.1f}%): "
-        f"{df['target_6h'].value_counts().sort_index().to_dict()}"
+        "Таргеты 6H (тройной барьер): %s",
+        df["target_6h"].value_counts().sort_index().to_dict(),
     )
     return df
 
 
-def _drop_leakage(df):
-    """
-    absolute_price_cols  : прямые цены и сырые объёмы — утечка в любой модели.
-    confirmed_duplicates : корреляция r > 0.95 с другим признаком.
-    legacy_cols          : устаревшие колонки из старых версий.
-    zero_signal_cols     : нулевой или незначимый сигнал по анализу 4H данных.
+def _add_price_context(df: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет стационарные ценовые производные."""
+    if "c_close" not in df.columns:
+        logger.warning("_add_price_context: нет c_close — шаг пропущен")
+        return df
 
-    weak_signal_cols     : ОСТАВЛЕН ПУСТЫМ — требует переоценки на 1H данных.
-                           Запустите корреляционный анализ на features_dataset.csv
-                           и заполните этот список по результатам.
-    """
+    close = df["c_close"]
+    win_90 = min(2160, max(60, len(df) // 8))
+    win_200 = min(4800, max(120, len(df) // 4))
+
+    df["price_log"] = np.log(close.clip(lower=1e-9))
+
+    sma_90 = close.rolling(win_90, min_periods=win_90 // 4).mean()
+    std_90 = close.rolling(win_90, min_periods=win_90 // 4).std()
+    df["price_zscore_90d"] = (
+        (close - sma_90) / std_90
+    ).replace([np.inf, -np.inf], np.nan)
+
+    df["price_rank_90d"] = (
+        close.rolling(win_90, min_periods=win_90 // 4).rank(pct=True)
+    )
+
+    sma_200 = close.rolling(win_200, min_periods=win_200 // 4).mean()
+    df["price_vs_sma_200d"] = (close / sma_200 - 1.0).replace(
+        [np.inf, -np.inf], np.nan
+    )
+
+    n_added = sum(
+        1
+        for c in [
+            "price_log",
+            "price_zscore_90d",
+            "price_rank_90d",
+            "price_vs_sma_200d",
+        ]
+        if c in df.columns
+    )
+    logger.info(
+        "_add_price_context: добавлено %d price_* колонок", n_added
+    )
+    return df
+
+
+def _drop_leakage(df: pd.DataFrame) -> pd.DataFrame:
+    """Удаляет абсолютные цены, дубликаты и нулевые-сигнальные колонки."""
     absolute_price_cols = [
-        # Свечи
-        "c_open", "c_high", "c_low", "c_close",
-        "c_volume", "c_turnover",
-        # Сырые taker-объёмы в USDT (scale-dependent, заменены z-score)
-        "c_taker_buy_vol", "c_taker_sell_vol",
-        # Макро абсолютные цены
-        "m_btc_close", "m_sp500_close",
-        "m_dxy_close", "m_gold_close", "m_tlt_close",
-        "m_ief_close", "m_oil_close",
-        "m_btc_sma_7d", "m_btc_sma_30d",
-        "m_btc_sma_90d", "m_btc_sma_200d",
+        "c_open",
+        "c_high",
+        "c_low",
+        "c_volume",
+        "c_turnover",
+        "c_taker_buy_vol",
+        "c_taker_sell_vol",
+        "m_btc_close",
+        "m_sp500_close",
+        "m_dxy_close",
+        "m_gold_close",
+        "m_tlt_close",
+        "m_ief_close",
+        "m_oil_close",
+        "m_btc_sma_7d",
+        "m_btc_sma_30d",
+        "m_btc_sma_90d",
+        "m_btc_sma_200d",
         "m_btc_spy_ratio",
-        # Дневные свечи
-        "d_open", "d_high", "d_low", "d_close",
+        "d_open",
+        "d_high",
+        "d_low",
+        "d_close",
         "d_volume",
-        # Фьючерсы — сырые уровни
         "oi_open_interest",
-        "ls_sell_ratio", "ls_ls_ratio",
-        # On-chain — сырые абсолютные уровни (заменены z-score)
-        "oc_tx_count", "oc_mempool_count", "oc_mempool_bytes",
-        "oc_hash_rate", "oc_fees_usd", "oc_tx_volume_usd",
+        "ls_sell_ratio",
+        "ls_ls_ratio",
     ]
-
     confirmed_duplicates = [
-        "m_btc_log_return",   # r=1.000 с m_btc_pct_change
-        "macd_signal",        # r=0.955 с macd
+        "m_btc_log_return",
+        "macd_signal",
     ]
-
     legacy_cols = [
-        "move_z_score",       # дублируется в m_move_z_score
-        "move_vix_spread",    # дублируется в m_move_vix_spread
-        "ls_short_dominant",  # обратный к ls_long_dominant
-        "candle_strength",    # устаревшее имя body_ratio
-        "vwap_dist_tmp",      # мёртвый код из старой версии
+        "move_z_score",
+        "move_vix_spread",
+        "ls_short_dominant",
+        "candle_strength",
+        "vwap_dist_tmp",
     ]
-
     zero_signal_cols = [
-        "m_btc_spy_corr_30d", "m_btc_spy_corr_90d",
-        "m_btc_dxy_corr_30d", "m_btc_dxy_corr_90d",
+        "m_btc_spy_corr_30d",
+        "m_btc_spy_corr_90d",
+        "m_btc_dxy_corr_30d",
+        "m_btc_dxy_corr_90d",
         "m_btc_volatility_30d",
         "d_turnover",
         "vix_medium",
-        "oc_mempool_pct",
     ]
-
-    # ── Требует переоценки на 1H данных ──────────────────────
-    # После генерации features_dataset.csv выполните:
-    #   corr = df[feature_cols].corrwith(df["target_1h"]).abs().sort_values()
-    #   weak = corr[corr < 0.01].index.tolist()
-    # И добавьте результат сюда.
-    weak_signal_cols: list = []
 
     all_to_drop = (
         absolute_price_cols
         + confirmed_duplicates
         + legacy_cols
         + zero_signal_cols
-        + weak_signal_cols
     )
-
     to_drop = [c for c in all_to_drop if c in df.columns]
     df = df.drop(columns=to_drop)
 
@@ -732,101 +861,44 @@ def _drop_leakage(df):
     )
     n_zero = len([c for c in zero_signal_cols if c in to_drop])
     logger.info(
-        f"Удалено {len(to_drop)} колонок: "
-        f"{n_price} абсолютных цен, "
-        f"{n_dupes} дубликатов/устаревших, "
-        f"{n_zero} нулевого сигнала"
+        "Удалено %d колонок: %d абсолютных цен, %d дубликатов, "
+        "%d нулевого сигнала",
+        len(to_drop),
+        n_price,
+        n_dupes,
+        n_zero,
     )
     return df
 
 
-
-def load_from_csv(csv_dir=".", prefix="btc"):
-    """
-    Загружает ранее сохранённые CSV из data_loader.save_all() и восстанавливает
-    dict, совместимый с build_features(), без повторного обращения к API.
-    """
-    source_keys = [
-        "candles_1h", "bybit_daily", "macro", "fear_greed",
-        "open_interest", "funding_rate", "long_short", "onchain",
-    ]
-    result = {}
-
-    for key in source_keys:
-        pattern = os.path.join(csv_dir, f"{prefix}_{key}_*.csv")
-        matches = sorted(glob.glob(pattern))
-
-        if not matches:
-            logger.warning(
-                f"load_from_csv: файл для '{key}' не найден ({pattern})"
-            )
-            result[key] = pd.DataFrame()
-            continue
-
-        path = matches[-1]
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
-
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-        df.index.name = "datetime"
-
-        result[key] = df
-        logger.info(
-            f"  {key:<20} {len(df):>6} строк | "
-            f"{df.index[0].date()} - {df.index[-1].date()} "
-            f"<- {os.path.basename(path)}"
+def _trim_warmup(df: pd.DataFrame, warmup_bars: int) -> pd.DataFrame:
+    """Отбрасывает первые warmup_bars (rolling-окна ещё накапливаются)."""
+    if len(df) > warmup_bars + 100:
+        df = df.iloc[warmup_bars:].copy()
+        logger.info("Отброшен warmup: %d баров", warmup_bars)
+    else:
+        logger.warning(
+            "Warmup cut пропущен: данных слишком мало (%d <= %d)",
+            len(df),
+            warmup_bars + 100,
         )
-
-    if result.get("candles_1h", pd.DataFrame()).empty:
-        raise FileNotFoundError(
-            f"Файл candles_1h не найден в '{csv_dir}'. "
-            "Сначала запустите data_loader.py и сохраните данные "
-            "через save_all()."
-        )
-
-    logger.info("load_from_csv: все источники загружены")
-    return result
+    return df
 
 
+# Главная функция построения признаков
 
-
-def build_features(data, threshold_1h=0.008, threshold_6h=0.02):
-    """
-    Строит полный датасет признаков из выхода data_loader.load_all().
-
-    Аргументы:
-        data          : dict из load_all() с ключом "candles_1h" как мастером.
-        threshold_1h  : порог для 1H таргета (по умолчанию 0.8%).
-        threshold_6h  : порог для 6H таргета (по умолчанию 2%).
-
-    Возвращает:
-        df           : DataFrame с признаками и таргетами.
-        feature_cols : список колонок-признаков (без таргетов).
-
-    Пайплайн:
-        1.  merge_sources         — объединение источников (мастер: candles_1h)
-        2.  handle_missing        — заполнение пропусков
-        3.  add_technical         — RSI(14/24/48), MACD, BB(24), ATR(14),
-                                    SMA(24/96/168/672), волатильность(24/168/672)
-        4.  add_volume_features   — volume_ratio(168), spike, VWAP(24),
-                                    taker z-scores, taker_vol_imbalance
-        5.  add_candle_features   — body, wicks, doji, hl_pct
-        6.  add_macro_features    — макро производные, shift(24) для pct-колонок
-        7.  add_futures_features  — OI + Funding + L/S Ratio
-        8.  add_onchain_features  — tx_count, hash_rate, mempool z-scores,
-                                    fees_tx_ratio, network_stress
-        9.  add_lags              — ret_lag(1/2/3/6/12/24), rsi_lag, funding_lag
-        10. add_time_features     — hour, dayofweek, session (Asia/EU/NY/overlap)
-        11. add_derived_momentum  — RSI velocity/accel, funding×OI, trend_strength
-        12. add_targets           — target_1h (±1%), target_6h (±2%)
-        13. drop_leakage          — удаление цен, дубликатов, устаревших
-
-    Примечание по warmup:
-        btc_to_sma200_1h требует 4800 баров (200 дней).
-        Рекомендуемый start_date: минимум за 300 дней до начала анализируемого периода.
-    """
-    logger.info("Построение признаков (мастер-индекс: 1H)")
-
+def build_features(
+    data: dict,
+    num_bars_1h: int = 1,
+    span_1h: int = 72,
+    pt_sl_1h: Tuple[float, float] = (1.0, 1.0),
+    min_target_1h: float = 0.0,
+    num_bars_6h: int = 6,
+    span_6h: int = 72,
+    pt_sl_6h: Tuple[float, float] = (1.0, 1.0),
+    min_target_6h: float = 0.0,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Строит датасет признаков и таргетов из словаря источников."""
     df = _merge_sources(data)
     df = _handle_missing(df)
     df = _add_technical(df)
@@ -834,159 +906,477 @@ def build_features(data, threshold_1h=0.008, threshold_6h=0.02):
     df = _add_candle_features(df)
     df = _add_macro_features(df)
     df = _add_futures_features(df)
-    df = _add_onchain_features(df)
-    onchain_cols = [c for c in df.columns if c.startswith('oc_')]
-    if onchain_cols:
-        first_valid = df[onchain_cols].first_valid_index()
-        if first_valid is not None:
-            before = len(df)
-            df = df.loc[first_valid:]
-            logger.info(
-                f"Обрезано по on-chain данным: удалено {before - len(df)} строк, "
-                f"начало с {first_valid.date()}"
-            )
-        else:
-            logger.warning("On-chain данные полностью отсутствуют (все NaN)")
     df = _add_lags(df)
     df = _add_time_features(df)
     df = _add_derived_momentum(df)
-    df = _add_targets(df, threshold_1h, threshold_6h)
+    df = _final_fillna(df)
+    df = _add_triple_barrier_targets(
+        df,
+        num_bars_1h=num_bars_1h,
+        span_1h=span_1h,
+        pt_sl_1h=pt_sl_1h,
+        min_target_1h=min_target_1h,
+        num_bars_6h=num_bars_6h,
+        span_6h=span_6h,
+        pt_sl_6h=pt_sl_6h,
+        min_target_6h=min_target_6h,
+    )
+    df = _add_price_context(df)
     df = _drop_leakage(df)
 
-    target_cols  = ["target_1h", "target_6h"]
-    feature_cols = [c for c in df.columns if c not in target_cols]
-
-    nan_frac = df[feature_cols].isnull().mean()
-    bad_cols = nan_frac[nan_frac > 0.50].index.tolist()
-    if bad_cols:
-        logger.warning(
-            f"Удалены признаки с >50% NaN ({len(bad_cols)}): {bad_cols}"
-        )
-        df = df.drop(columns=bad_cols)
-        feature_cols = [c for c in feature_cols if c not in bad_cols]
-
-    # Диагностика NaN перед финальным dropna
-    before = len(df)
-    nan_per_col = df[feature_cols].isnull().sum()
-    nan_per_col = nan_per_col[nan_per_col > 0].sort_values(ascending=False)
-    if not nan_per_col.empty:
-        logger.warning(
-            f"Признаки с NaN перед dropna (топ-10): "
-            f"{nan_per_col.head(10).to_dict()}"
-        )
-        rows_with_nan = df[feature_cols].isnull().any(axis=1).sum()
-        logger.warning(
-            f"Строк будет удалено dropna: {rows_with_nan} из {before}"
-        )
-
-    before = len(df)
-    df = df.dropna(subset=feature_cols)
-    logger.info(f"Удалено {before - len(df)} строк с NaN (rolling warmup)")
-
-    if df.empty:
-        logger.warning(
-            "DataFrame пуст после dropna. Вероятная причина: недостаточно данных "
-            "для rolling-окон (btc_to_sma200_1h требует >= 4800 1H-баров = ~200 дней)."
-            " Минимальный рекомендуемый start_date: за 300+ дней до текущей даты."
-        )
-        return df, feature_cols
-
-    logger.info(f"Итого: {len(df)} строк, {len(feature_cols)} признаков")
+    feature_cols = [
+        c
+        for c in df.columns
+        if c
+        not in ("target_1h", "target_6h", "fwd_ret_1h", "fwd_ret_6h")
+    ]
     logger.info(
-        f"Период: {df.index[0].date()} - {df.index[-1].date()}"
+        "build_features: %d строк, %d признаков",
+        len(df),
+        len(feature_cols),
     )
-    logger.info(
-        f"Баланс target_1h : "
-        f"{df['target_1h'].value_counts().sort_index().to_dict()}"
-    )
-    logger.info(
-        f"Баланс target_6h : "
-        f"{df['target_6h'].value_counts().sort_index().to_dict()}"
-    )
-
     return df, feature_cols
 
 
+# CSV-утилиты
 
-def train_test_split_time(df, feature_cols, target_col, test_size=0.2):
-    """
-    Временное разбиение train/test без random split.
-    Нормализацию делать fit только на train, transform на test.
-    """
-    split_idx  = int(len(df) * (1 - test_size))
-    split_date = df.index[split_idx]
+def check_csv_files(csv_dir: str = ".", prefix: str = "btc") -> dict:
+    """Ищет сохранённые CSV-файлы по ключам источников."""
+    source_keys = [
+        "candles_1h",
+        "bybit_daily",
+        "macro",
+        "fear_greed",
+        "open_interest",
+        "funding_rate",
+        "long_short",
+        "sentiment",
+    ]
+    result = {}
+    logger.info("Поиск CSV-файлов в '%s' (prefix='%s')", csv_dir, prefix)
+    for key in source_keys:
+        pattern = os.path.join(csv_dir, f"{prefix}_{key}_*.csv")
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            result[key] = matches[-1]
+            logger.info(
+                "  OK %-20s -> %s", key, os.path.basename(matches[-1])
+            )
+        else:
+            result[key] = None
+            logger.warning(
+                "  MISS %-20s -> не найден (%s)", key, pattern
+            )
 
-    train = df[df.index <  split_date]
-    test  = df[df.index >= split_date]
-
-    X_train = train[feature_cols]
-    y_train = train[target_col]
-    X_test  = test[feature_cols]
-    y_test  = test[target_col]
-
+    found = [k for k, v in result.items() if v is not None]
+    missing = [k for k, v in result.items() if v is None]
     logger.info(
-        f"Train: {len(train)} строк | "
-        f"{train.index[0].date()} - {train.index[-1].date()}"
+        "Итог: найдено %d/%d файлов%s",
+        len(found),
+        len(source_keys),
+        (f", отсутствуют: {missing}" if missing else ""),
     )
-    logger.info(
-        f"Test:  {len(test)} строк  | "
-        f"{test.index[0].date()} - {test.index[-1].date()}"
+    return result
+
+
+def load_from_csv(csv_dir: str = ".", prefix: str = "btc") -> dict:
+    """Загружает все источники из CSV-файлов."""
+    csv_map = check_csv_files(csv_dir, prefix)
+    data = {}
+    for key, filepath in csv_map.items():
+        if filepath is None:
+            data[key] = pd.DataFrame()
+            continue
+        try:
+            df = pd.read_csv(filepath, index_col=0, parse_dates=True)
+            if hasattr(df.index, "tz") and df.index.tz is not None:
+                df.index = df.index.tz_convert(None)
+            data[key] = df
+            logger.info("Загружен %-20s: %d строк", key, len(df))
+        except Exception as exc:
+            logger.error("Ошибка загрузки %s: %s", filepath, exc)
+            data[key] = pd.DataFrame()
+    return data
+
+
+def _api_load(start_date: Optional[str] = None) -> dict:
+    """Загружает данные через data_loader.load_all."""
+    from data_loader import load_all  # noqa: PLC0415
+
+    if start_date is None:
+        start_date = (
+            datetime.now()
+            - timedelta(days=WARMUP_DAYS + RECOMMENDED_DAYS_6H)
+        ).strftime("%Y-%m-%d")
+    logger.info("API-загрузка данных с %s ...", start_date)
+    return load_all(start_date=start_date)
+
+
+def smart_load_data(
+    csv_dir: str = ".",
+    prefix: str = "btc",
+    start_date: Optional[str] = None,
+    force_api: bool = False,
+) -> dict:
+    """Умная загрузка: CSV если есть, иначе API."""
+    if force_api:
+        logger.info("smart_load_data: force_api=True -> API")
+        return _api_load(start_date)
+
+    csv_map = check_csv_files(csv_dir, prefix)
+    candles_ok = csv_map.get("candles_1h") is not None
+    missing = [k for k, v in csv_map.items() if v is None]
+
+    if candles_ok:
+        if missing:
+            logger.warning(
+                "smart_load_data: candles_1h найден, отсутствуют: %s. "
+                "Загружаем из CSV.",
+                missing,
+            )
+        else:
+            logger.info(
+                "smart_load_data: все CSV найдены -> load_from_csv()"
+            )
+        return load_from_csv(csv_dir, prefix)
+
+    logger.warning(
+        "smart_load_data: candles_1h не найден -> API-загрузка"
     )
+    if start_date is None:
+        start_date = (
+            datetime.now()
+            - timedelta(days=WARMUP_DAYS + RECOMMENDED_DAYS_6H)
+        ).strftime("%Y-%m-%d")
+        logger.info("start_date не задан, дефолт: %s", start_date)
+    return _api_load(start_date)
 
-    return X_train, X_test, y_train, y_test
+# Pipeline для 1H
 
-
-def walk_forward_splits(df, n_folds=5, test_months=3):
-    """
-    Walk-forward splits с расширяющимся окном трейна.
-    Возвращает список кортежей (train_idx, test_idx).
-    test_size рассчитывается в барах на основе фактического диапазона дат.
-    """
-    splits = []
-    total  = len(df)
-    test_size = int(
-        total * test_months
-        / ((df.index[-1] - df.index[0]).days / 30)
-    )
-    min_train = int(total * 0.60)
-
-    for fold in range(n_folds):
-        test_end   = total - fold * test_size
-        test_start = test_end - test_size
-        if test_start < min_train:
-            break
-        train_idx = df.index[:test_start]
-        test_idx  = df.index[test_start:test_end]
-        splits.append((train_idx, test_idx))
+def build_features_1h(
+    data: Optional[dict] = None,
+    days: int = RECOMMENDED_DAYS_1H,
+    num_bars: int = 1,
+    span: int = 72,
+    pt_sl: Tuple[float, float] = (1.0, 1.0),
+    min_target: float = 0.0,
+    csv_dir: str = ".",
+    prefix: str = "btc",
+    force_api: bool = False,
+    warmup_days: int = 60,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Полный pipeline для 1H датасета."""
+    if data is None:
+        total_days = days + warmup_days
+        start_date = (
+            datetime.now() - timedelta(days=total_days)
+        ).strftime("%Y-%m-%d")
         logger.info(
-            f"Fold {n_folds - fold}: "
-            f"train до {train_idx[-1].date()} | "
-            f"test {test_idx[0].date()} — {test_idx[-1].date()} "
-            f"({len(test_idx)} баров)"
+            "1H pipeline: данные с %s (%d + %d = %d дней)",
+            start_date,
+            days,
+            warmup_days,
+            total_days,
+        )
+        data = smart_load_data(
+            csv_dir=csv_dir,
+            prefix=prefix,
+            start_date=start_date,
+            force_api=force_api,
         )
 
-    return list(reversed(splits))
+    df, feature_cols = build_features(
+        data,
+        num_bars_1h=num_bars,
+        span_1h=span,
+        pt_sl_1h=pt_sl,
+        min_target_1h=min_target,
+    )
+    if df.empty:
+        logger.error("1H: build_features вернул пустой DataFrame")
+        return df, []
 
+    df = _trim_warmup(df, warmup_bars=warmup_days * 24)
+    if df.empty:
+        logger.error("1H: после warmup cut DataFrame пуст")
+        return df, []
 
+    actual_days = (df.index.max() - df.index.min()).days
+    if actual_days < days * 0.9:
+        logger.warning(
+            "1H: запрошено %d дней, получено %d.", days, actual_days
+        )
 
-if __name__ == "__main__":
-    csv_files = sorted(glob.glob("btc_*.csv"))
-    if csv_files:
-        logger.info(f"Найдены CSV: {csv_files}")
-        data = load_from_csv()
-    else:
-        logger.info("CSV не найдены, запускаем data_loader")
-        from data_loader import load_all, START_DATE
-        data = load_all(start_date=START_DATE)
+    target_and_ret = ["target_1h", "fwd_ret_1h"]
+    keep = [
+        c for c in feature_cols if c in df.columns
+    ] + [c for c in target_and_ret if c in df.columns]
+    df = df[keep].copy()
+    df = df.rename(
+        columns={"target_1h": "target", "fwd_ret_1h": "fwd_ret"}
+    )
+    feature_cols_out = [
+        c for c in df.columns if c not in ("target", "fwd_ret")
+    ]
+
+    logger.info(
+        "1H датасет: %d строк, %d признаков | %s - %s (%d дней)",
+        len(df),
+        len(feature_cols_out),
+        df.index[0].date(),
+        df.index[-1].date(),
+        actual_days,
+    )
+    logger.info(
+        "  target balance: %s",
+        df["target"].value_counts().sort_index().to_dict(),
+    )
+    return df, feature_cols_out
+
+# Pipeline для 6H
+
+def build_features_6h(
+    data: Optional[dict] = None,
+    days: int = RECOMMENDED_DAYS_6H,
+    num_bars: int = 6,
+    span: int = 72,
+    pt_sl: Tuple[float, float] = (1.0, 1.0),
+    min_target: float = 0.0,
+    csv_dir: str = ".",
+    prefix: str = "btc",
+    force_api: bool = False,
+    warmup_days: int = WARMUP_DAYS,  # 210 дней, как и было
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Полный pipeline для 6H датасета."""
+    if data is None:
+        total_days = days + warmup_days
+        start_date = (
+            datetime.now() - timedelta(days=total_days)
+        ).strftime("%Y-%m-%d")
+        logger.info(
+            "6H pipeline: данные с %s (%d + %d = %d дней)",
+            start_date,
+            days,
+            warmup_days,
+            total_days,
+        )
+        data = smart_load_data(
+            csv_dir=csv_dir,
+            prefix=prefix,
+            start_date=start_date,
+            force_api=force_api,
+        )
 
     df, feature_cols = build_features(
-        data, threshold_1h=0.008, threshold_6h=0.02
+        data,
+        num_bars_6h=num_bars,
+        span_6h=span,
+        pt_sl_6h=pt_sl,
+        min_target_6h=min_target,
+    )
+    if df.empty:
+        logger.error("6H: build_features вернул пустой DataFrame")
+        return df, []
+
+    df = _trim_warmup(df, warmup_bars=warmup_days * 24)
+    if df.empty:
+        logger.error("6H: после warmup cut DataFrame пуст")
+        return df, []
+
+    actual_days = (df.index.max() - df.index.min()).days
+    if actual_days < days * 0.9:
+        logger.warning(
+            "6H: запрошено %d дней, получено %d.", days, actual_days
+        )
+
+    target_and_ret = ["target_6h", "fwd_ret_6h"]
+    keep = [
+        c for c in feature_cols if c in df.columns
+    ] + [c for c in target_and_ret if c in df.columns]
+    df_6h = df[keep].iloc[::6].copy()
+
+    idx_6h = df_6h.index
+    df_6h["hour"] = idx_6h.hour
+    df_6h["is_weekend"] = (idx_6h.dayofweek >= 5).astype(int)
+    df_6h["month"] = idx_6h.month
+
+    df_6h = df_6h.rename(
+        columns={"target_6h": "target", "fwd_ret_6h": "fwd_ret"}
+    )
+    df_6h = df_6h.dropna(subset=["target"])
+
+    if "oi_change_6bar" in df_6h.columns:
+        if "oi_change_pct" in df_6h.columns:
+            df_6h = df_6h.drop(columns=["oi_change_pct"])
+        df_6h = df_6h.rename(
+            columns={"oi_change_6bar": "oi_change_pct"}
+        )
+
+    if "bars_since_big_move" in df_6h.columns:
+        df_6h["bars_since_big_move"] = (
+            (df_6h["bars_since_big_move"] / 6)
+            .round()
+            .astype(int)
+            .clip(upper=112)
+        )
+
+    to_drop_6h = [c for c in FORCE_DROP_6H if c in df_6h.columns]
+    if to_drop_6h:
+        df_6h = df_6h.drop(columns=to_drop_6h)
+        logger.info(
+            "6H: удалены sub-hour/константные колонки: %s",
+            to_drop_6h,
+        )
+
+    rename_map = {}
+    if "ret_lag_6" in df_6h.columns:
+        rename_map["ret_lag_6"] = "ret_lag_1_6h"
+    if "ret_lag_12" in df_6h.columns:
+        rename_map["ret_lag_12"] = "ret_lag_2_6h"
+    if "ret_lag_24" in df_6h.columns:
+        rename_map["ret_lag_24"] = "ret_lag_4_6h"
+    if rename_map:
+        df_6h = df_6h.rename(columns=rename_map)
+
+    feature_cols_6h = [
+        c for c in df_6h.columns if c not in ("target", "fwd_ret")
+    ]
+    logger.info(
+        "6H датасет: %d строк, %d признаков | %s - %s (%d дней)",
+        len(df_6h),
+        len(feature_cols_6h),
+        df_6h.index[0].date(),
+        df_6h.index[-1].date(),
+        actual_days,
+    )
+    logger.info(
+        "  target balance: %s",
+        df_6h["target"].value_counts().sort_index().to_dict(),
+    )
+    return df_6h, feature_cols_6h
+
+
+# Точка входа
+
+if __name__ == "__main__":
+    import gc
+    import time as _time
+    from datetime import timezone
+
+    DAYS_1H = 720
+    DAYS_6H = 720
+    CSV_DIR = "."
+    PREFIX = "btc"
+    FORCE_API = True
+
+    _MSK = timezone(timedelta(hours=3))
+    total_days = max(DAYS_1H, DAYS_6H) + WARMUP_DAYS
+    start_date = (
+        datetime.now(_MSK) - timedelta(days=total_days)
+    ).strftime("%Y-%m-%d")
+    logger.info(
+        "Единая загрузка: %d дней (max(%d, %d) + %d warmup)",
+        total_days,
+        DAYS_1H,
+        DAYS_6H,
+        WARMUP_DAYS,
     )
 
-    df.to_csv("features_dataset.csv")
-    logger.info("Сохранено в features_dataset.csv")
+    t0 = _time.time()
+    data = load_from_csv(csv_dir=CSV_DIR, prefix=PREFIX)
+    t_load = _time.time() - t0
+    logger.info("Загрузка завершена за %.0f сек", t_load)
 
-    print(f"\nИтого признаков: {len(feature_cols)}")
-    print("\nСписок признаков:")
-    for i, f in enumerate(feature_cols, 1):
-        print(f"  {i:3d}. {f}") 
+    # Настройка тройного баррьера 
+    t0 = _time.time()
+    df_1h, feat_1h = build_features_1h(
+        data=data,
+        days=DAYS_1H,
+        num_bars=2,
+        span=72,
+        pt_sl=(2.0, 2.0),
+        min_target=0.001,
+    )
+    t_1h = _time.time() - t0
+
+    t0 = _time.time()
+    df_6h, feat_6h = build_features_6h(
+        data=data,
+        days=DAYS_6H,
+        num_bars=4,
+        span=210,
+        pt_sl=(2.5, 2.5),
+        min_target=0.001,
+    )
+    t_6h = _time.time() - t0
+
+    del data
+    gc.collect()
+
+    print("\n" + "=" * 62)
+    print("СВОДКА")
+    print("=" * 62)
+    print(f"Загрузка: {t_load:.0f} сек")
+
+    if not df_1h.empty:
+        d1 = (df_1h.index[-1] - df_1h.index[0]).days
+        fname_1h = "features_1h.csv"
+        df_1h.to_csv(fname_1h)
+        logger.info(
+            "Сохранено %s | %s — %s",
+            fname_1h,
+            df_1h.index[0].date(),
+            df_1h.index[-1].date(),
+        )
+        print(
+            f"1H датасет:  {len(df_1h):>6} строк | "
+            f"{len(feat_1h):>3} признаков | {d1} дней | {t_1h:.0f} сек"
+        )
+        print(
+            f"  Период: {df_1h.index[0].date()} — "
+            f"{df_1h.index[-1].date()}"
+        )
+        print(
+            f"  Таргет: "
+            f"{df_1h['target'].value_counts().sort_index().to_dict()}"
+        )
+        print(f"  Файл  : {fname_1h}")
+    else:
+        print("1H датасет:  ПУСТО")
+
+    print()
+
+    if not df_6h.empty:
+        d6 = (df_6h.index[-1] - df_6h.index[0]).days
+        fname_6h = "features_6h.csv"
+        df_6h.to_csv(fname_6h)
+        logger.info(
+            "Сохранено %s | %s — %s",
+            fname_6h,
+            df_6h.index[0].date(),
+            df_6h.index[-1].date(),
+        )
+        print(
+            f"6H датасет:  {len(df_6h):>6} строк | "
+            f"{len(feat_6h):>3} признаков | {d6} дней | {t_6h:.0f} сек"
+        )
+        print(
+            f"  Период: {df_6h.index[0].date()} — "
+            f"{df_6h.index[-1].date()}"
+        )
+        print(
+            f"  Таргет: "
+            f"{df_6h['target'].value_counts().sort_index().to_dict()}"
+        )
+        print(f"  Файл  : {fname_6h}")
+    else:
+        print("6H датасет:  ПУСТО")
+
+    if not df_1h.empty and not df_6h.empty:
+        print(
+            f"\nСоотношение строк 1H/6H ~ "
+            f"{len(df_1h) / len(df_6h):.1f}:1  (теория 6:1)"
+        )
+
+    del df_1h, df_6h, feat_1h, feat_6h
+    gc.collect()
