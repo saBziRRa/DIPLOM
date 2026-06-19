@@ -1,17 +1,28 @@
-"""Plotly chart export for Telegram."""
+"""Matplotlib рендеринг графика"""
+
 
 from __future__ import annotations
 
-import plotly.graph_objects as go
+import io
+
+import matplotlib
+
+matplotlib.use("Agg")  # headless-бэкенд, без GUI и подпроцессов
+
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter
 
 from btc_forecast.models.inference import ForecastResult
 
+plt.rcParams["font.family"] = "DejaVu Sans"  # поддержка кириллицы
+
 COLORS = {
+    "background": "#121212",
     "history": "#ffffff",
-    "anchor": "#9e9e9e",
     "up": "#00e676",
     "down": "#ff5252",
-    "now": "#ffd600",
+    "text": "#e0e0e0",
+    "grid": "#333333",
 }
 
 
@@ -22,58 +33,75 @@ def render_chart(result: ForecastResult, tf: str, lookback: int = 100) -> bytes:
 
     price = fc.last_price
     res = fc.horizon
-    hist_idx = [str(result.updated_at)] * min(lookback, 50)
-    hist_y = [price] * len(hist_idx)
 
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=hist_idx,
-            y=hist_y,
-            mode="lines",
-            name="Цена",
-            line=dict(color=COLORS["history"], width=2),
-        )
-    )
+    hist_len = min(lookback, 50)
+    hist_x = [result.updated_at] * hist_len
+    hist_y = [price] * hist_len
 
     up = res[res["signal"] == 1]
     dn = res[res["signal"] == -1]
+
+    fig, ax = plt.subplots(figsize=(10, 5.5), dpi=100)
+    fig.patch.set_facecolor(COLORS["background"])
+    ax.set_facecolor(COLORS["background"])
+
+    ax.plot(
+        hist_x,
+        hist_y,
+        color=COLORS["history"],
+        linewidth=2,
+        label="Цена",
+    )
+
     if not up.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=up.index.astype(str),
-                y=[price] * len(up),
-                mode="markers",
-                name="UP",
-                marker=dict(color=COLORS["up"], size=14, symbol="triangle-up"),
-            )
+        ax.scatter(
+            up.index,
+            [price] * len(up),
+            color=COLORS["up"],
+            marker="^",
+            s=180,
+            label="UP",
+            zorder=3,
         )
     if not dn.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=dn.index.astype(str),
-                y=[price] * len(dn),
-                mode="markers",
-                name="DOWN",
-                marker=dict(color=COLORS["down"], size=14, symbol="triangle-down"),
-            )
+        ax.scatter(
+            dn.index,
+            [price] * len(dn),
+            color=COLORS["down"],
+            marker="v",
+            s=180,
+            label="DOWN",
+            zorder=3,
         )
 
     unit = res.attrs.get("unit", "ч")
     horizon = float(res["units_ahead"].iloc[-1])
-    fig.update_layout(
-        title=f"{tf.upper()} прогноз на {horizon:.0f} {unit} (frozen-features)",
-        template="plotly_dark",
-        height=500,
+    ax.set_title(
+        f"{tf.upper()} прогноз на {horizon:.0f} {unit} (frozen-features)",
+        color=COLORS["text"],
+        fontsize=13,
     )
 
+    ax.tick_params(colors=COLORS["text"])
+    ax.xaxis.set_major_formatter(DateFormatter("%d.%m %H:%M"))
+    fig.autofmt_xdate(rotation=30)
+
+    for spine in ax.spines.values():
+        spine.set_color(COLORS["grid"])
+    ax.grid(color=COLORS["grid"], linewidth=0.5, alpha=0.6)
+
+    ax.legend(
+        facecolor=COLORS["background"],
+        edgecolor=COLORS["grid"],
+        labelcolor=COLORS["text"],
+    )
+
+    fig.tight_layout()
+
+    buf = io.BytesIO()
     try:
-        return fig.to_image(format="png", engine="kaleido")
-    except Exception as exc:
-        # Не подменяем PNG на HTML-байты: VK/Telegram грузят их как
-        # forecast.png и получают битое изображение. Лучше явная ошибка —
-        # её перехватит хендлер команды и пришлёт текстом.
-        raise RuntimeError(
-            "Не удалось отрисовать график. Нужен kaleido 0.2.1 "
-            "(pip install \"kaleido==0.2.1\"); версии 1.x требуют Chrome."
-        ) from exc
+        fig.savefig(buf, format="png", facecolor=COLORS["background"])
+    finally:
+        plt.close(fig)
+
+    return buf.getvalue()

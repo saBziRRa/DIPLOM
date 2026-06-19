@@ -29,9 +29,18 @@ EVENT_TIMEOUT_SEC = 60.0
 GENERIC_ERROR = "Произошла ошибка при обработке команды. Попробуйте позже."
 
 _COMMANDS = {
-    "start", "help", "info", "summary", "forecast", "chart",
-    "subscribe", "unsubscribe", "settings", "refresh",
+    "start",
+    "help",
+    "info",
+    "summary",
+    "forecast",
+    "chart",
+    "subscribe",
+    "unsubscribe",
+    "settings",
+    "refresh",
 }
+
 # Алиасы: латиница и русские названия.
 _ALIASES = {
     "помощь": "help",
@@ -84,12 +93,16 @@ def _send_text(vk: Any, peer_id: int, text: str) -> None:
     vk.messages.send(peer_id=peer_id, random_id=get_random_id(), message=text)
 
 
-def _send_photo(vk: Any, upload: VkUpload, peer_id: int, image_bytes: bytes) -> None:
+def _send_photo(
+    vk: Any, upload: VkUpload, peer_id: int, image_bytes: bytes
+) -> None:
     stream = io.BytesIO(image_bytes)
     stream.name = "forecast.png"
     photo = upload.photo_messages([stream], peer_id=peer_id)[0]
     attachment = f"photo{photo['owner_id']}_{photo['id']}"
-    vk.messages.send(peer_id=peer_id, random_id=get_random_id(), attachment=attachment)
+    vk.messages.send(
+        peer_id=peer_id, random_id=get_random_id(), attachment=attachment
+    )
 
 
 async def _a_send_text(vk: Any, peer_id: int, text: str) -> None:
@@ -149,7 +162,9 @@ def _send_menu(vk: Any, peer_id: int, text: str, keyboard: str) -> None:
     )
 
 
-async def _a_send_menu(vk: Any, peer_id: int, text: str, keyboard: str) -> None:
+async def _a_send_menu(
+    vk: Any, peer_id: int, text: str, keyboard: str
+) -> None:
     await asyncio.to_thread(_send_menu, vk, peer_id, text, keyboard)
 
 
@@ -194,20 +209,23 @@ async def _handle_event(vk: Any, upload: VkUpload, event: Any) -> None:
         if cmd == "forecast":
             if arg and _normalize_tf(arg) is None:
                 await _a_send_text(
-                    vk, peer_id,
+                    vk,
+                    peer_id,
                     "Укажите таймфрейм 1h или 6h, например: /forecast 1h",
                 )
                 return
             result = await asyncio.to_thread(get_cached_predict, run_predict)
             await _a_send_text(
-                vk, peer_id,
+                vk,
+                peer_id,
                 formatters.format_forecast(result, tf=_normalize_tf(arg)),
             )
             return
         if cmd == "chart":
             if arg and _normalize_tf(arg) is None:
                 await _a_send_text(
-                    vk, peer_id,
+                    vk,
+                    peer_id,
                     "Укажите таймфрейм 1h или 6h, например: /chart 1h",
                 )
                 return
@@ -215,9 +233,11 @@ async def _handle_event(vk: Any, upload: VkUpload, event: Any) -> None:
             result = await asyncio.to_thread(get_cached_predict, run_predict)
             try:
                 img = await asyncio.to_thread(charts.render_chart, result, tf)
-            except RuntimeError as exc:
+            except Exception as exc:
                 logger.exception("chart render failed")
-                await _a_send_text(vk, peer_id, str(exc))
+                await _a_send_text(
+                    vk, peer_id, f"Не удалось построить график: {exc}"
+                )
                 return
             await _a_send_photo(vk, upload, peer_id, img)
             return
@@ -227,7 +247,8 @@ async def _handle_event(vk: Any, upload: VkUpload, event: Any) -> None:
                 threshold = _parse_threshold(arg)
                 if threshold is None:
                     await _a_send_text(
-                        vk, peer_id,
+                        vk,
+                        peer_id,
                         "Укажите число от 0.5 до 0.95, например: /subscribe 0.7",
                     )
                     return
@@ -237,22 +258,29 @@ async def _handle_event(vk: Any, upload: VkUpload, event: Any) -> None:
             changed = await asyncio.to_thread(userstate.subscribe, from_id)
             rec = await asyncio.to_thread(userstate.get_user, from_id)
             await _a_send_text(
-                vk, peer_id,
-                formatters.format_subscription(True, changed, rec["min_confidence"]),
+                vk,
+                peer_id,
+                formatters.format_subscription(
+                    True, changed, rec["min_confidence"]
+                ),
             )
             return
         if cmd == "unsubscribe":
             changed = await asyncio.to_thread(userstate.unsubscribe, from_id)
             rec = await asyncio.to_thread(userstate.get_user, from_id)
             await _a_send_text(
-                vk, peer_id,
-                formatters.format_subscription(False, changed, rec["min_confidence"]),
+                vk,
+                peer_id,
+                formatters.format_subscription(
+                    False, changed, rec["min_confidence"]
+                ),
             )
             return
         if cmd == "settings":
             rec = await asyncio.to_thread(userstate.get_user, from_id)
             await _a_send_menu(
-                vk, peer_id,
+                vk,
+                peer_id,
                 formatters.format_settings(rec),
                 _settings_keyboard(),
             )
@@ -348,3 +376,7 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     asyncio.run(run_vk_bot())
+
+
+if __name__ == "__main__":
+    main()
