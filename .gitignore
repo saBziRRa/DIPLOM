@@ -1,0 +1,27 @@
+# Local / IDE
+.cursor/
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+
+# Secrets
+.env
+
+# Runtime artifacts
+artifacts/
+*.pkl
+btc_*.csv
+final_dataset_*.csv
+features_*.csv
+best_params*.json
+
+# Build
+*.egg-info/
+dist/
+build/

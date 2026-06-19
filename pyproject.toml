@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "btc-forecast"
+version = "1.0.0"
+description = "BTCUSDT cascade forecast Telegram bot"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "requests>=2.31",
+    "yfinance>=0.2",
+    "urllib3>=2.0",
+    "scikit-learn>=1.3",
+    "xgboost>=2.0",
+    "lightgbm>=4.0",
+    "optuna>=3.5",
+    "aiogram>=3.4",
+    "plotly>=5.18",
+    "kaleido==0.2.1",
+    "pydantic-settings>=2.0",
+    "pyyaml>=6.0",
+    "apscheduler>=3.10",
+    "aiohttp>=3.9",
+    "vk_api>=11.9",
+]
+
+[project.optional-dependencies]
+sentiment = ["transformers>=4.36", "vaderSentiment>=3.3"]
+dev = ["pytest>=7.4", "ruff>=0.1"]
+
+[project.scripts]
+btc-ingest = "btc_forecast.cli:ingest_cmd"
+btc-train = "btc_forecast.cli:train_cmd"
+btc-bot = "btc_forecast.cli:bot_cmd"
+btc-vk-bot = "btc_forecast.cli:vk_bot_cmd"
+btc-predict = "btc_forecast.cli:predict_cmd"
+btc-debug = "btc_forecast.cli:debug_cmd"
+btc-dashboard = "btc_forecast.cli:dashboard_cmd"
+btc-benchmark = "btc_forecast.cli:benchmark_cmd"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+btc_forecast = ["debug/dashboard.html", "debug/debug.html", "debug/benchmark.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

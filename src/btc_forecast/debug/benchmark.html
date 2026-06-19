@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BTC Forecast — Benchmark</title>
+  <style>
+    :root { --bg:#0f1117; --card:#1a1d27; --border:#2a2f3d; --text:#e6e8ef; --muted:#8b90a0; --accent:#5b8def; --ok:#3dd68c; --warn:#f5a623; --err:#ff5c5c; }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:ui-sans-serif,system-ui,sans-serif;background:var(--bg);color:var(--text)}
+    header{padding:1rem 1.5rem;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap}
+    h1{margin:0;font-size:1.2rem}
+    .meta{color:var(--muted);font-size:.85rem}
+    main{padding:1rem 1.5rem 2rem;display:grid;gap:1rem}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:1rem}
+    .controls{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+    input,textarea,button{background:#12141c;color:var(--text);border:1px solid #304061;border-radius:6px;padding:.45rem .6rem;font-size:.85rem}
+    input,textarea{min-width:220px}
+    textarea{min-height:64px;resize:vertical}
+    button{background:#24324f;cursor:pointer}
+    button:hover{filter:brightness(1.1)}
+    .mini{color:var(--muted);font-size:.8rem}
+    .grid{display:grid;gap:.8rem;grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+    .metric{display:flex;justify-content:space-between;padding:.3rem 0;border-bottom:1px solid var(--border);font-size:.86rem}
+    .metric:last-child{border-bottom:none}
+    .up{color:var(--ok)} .down{color:var(--err)}
+    table{width:100%;border-collapse:collapse;font-size:.8rem}
+    th,td{border-bottom:1px solid var(--border);padding:.35rem .4rem;text-align:left}
+    th{color:var(--muted);font-weight:600}
+    .nowrap{white-space:nowrap}
+    .chart-grid{display:grid;gap:.8rem;grid-template-columns:repeat(auto-fit,minmax(360px,1fr))}
+    .chart-card{background:#12141c;border:1px solid var(--border);border-radius:8px;padding:.7rem}
+    .chart-title{font-size:.82rem;color:var(--muted);margin-bottom:.35rem}
+    .chart-wrap{height:190px}
+    .chart-wrap svg{width:100%;height:100%;display:block}
+    .line-1h{stroke:#5b8def;fill:none;stroke-width:2}
+    .line-6h{stroke:#3dd68c;fill:none;stroke-width:2}
+    .axis{stroke:#2a2f3d;stroke-width:1}
+    .chart-legend{display:flex;gap:.8rem;font-size:.76rem;color:var(--muted);margin-top:.35rem}
+    .dot{display:inline-block;width:.6rem;height:.6rem;border-radius:999px;margin-right:.25rem}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>BTC Forecast — Benchmark Compare</h1>
+      <div class="meta" id="updated">Загрузка…</div>
+    </div>
+    <div class="controls">
+      <button onclick="window.close()">Закрыть вкладку</button>
+      <button onclick="refreshData()">Обновить</button>
+    </div>
+  </header>
+  <main id="main"></main>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const token = params.get("token");
+    function apiUrl(path){const u=new URL(path,location.origin);if(token)u.searchParams.set("token",token);return u.toString();}
+    function num(v,d=4){if(v==null||Number.isNaN(Number(v)))return "—";return Number(v).toFixed(d);}
+    function delta(cur,prev){if(prev==null||Number.isNaN(Number(prev)))return "—";const d=Number(cur)-Number(prev);const cls=d>=0?"up":"down";return `<span class="${cls}">${d>=0?"+":""}${d.toFixed(4)}</span>`;}
+    function esc(s){return String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;");}
+
+    function metricSeries(rows, tf, metric){
+      return rows
+        .filter(r => r.tf === tf)
+        .sort((a,b) => new Date(a.created_at||0) - new Date(b.created_at||0))
+        .map(r => ({x: new Date(r.created_at||0).getTime(), y: Number(r[metric]), run_id: r.run_id}))
+        .filter(p => Number.isFinite(p.y));
+    }
+
+    function makePolyline(points, xMin, xMax, yMin, yMax, width, height, pad){
+      if(points.length < 2) return "";
+      const sx = x => pad + ((x - xMin) / Math.max(xMax - xMin, 1e-9)) * (width - 2*pad);
+      const sy = y => height - pad - ((y - yMin) / Math.max(yMax - yMin, 1e-9)) * (height - 2*pad);
+      return points.map(p => `${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`).join(" ");
+    }
+
+    function chartCard(rows, metric, title){
+      const s1 = metricSeries(rows, "1h", metric);
+      const s6 = metricSeries(rows, "6h", metric);
+      const all = [...s1, ...s6];
+      if(!all.length){
+        return `<article class="chart-card"><div class="chart-title">${esc(title)}</div><div class="mini">Нет данных</div></article>`;
+      }
+      const width = 420, height = 190, pad = 24;
+      const xs = all.map(p => p.x), ys = all.map(p => p.y);
+      const xMin = Math.min(...xs), xMax = Math.max(...xs);
+      let yMin = Math.min(...ys), yMax = Math.max(...ys);
+      if(yMin === yMax){ yMin -= 0.01; yMax += 0.01; }
+
+      const p1 = makePolyline(s1, xMin, xMax, yMin, yMax, width, height, pad);
+      const p6 = makePolyline(s6, xMin, xMax, yMin, yMax, width, height, pad);
+      const y0 = (0 >= yMin && 0 <= yMax)
+        ? (height - pad - ((0 - yMin) / (yMax - yMin)) * (height - 2*pad)).toFixed(1)
+        : null;
+
+      return `<article class="chart-card">
+        <div class="chart-title">${esc(title)} <span class="mini">(min ${num(yMin)} / max ${num(yMax)})</span></div>
+        <div class="chart-wrap">
+          <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+            <line class="axis" x1="${pad}" y1="${height-pad}" x2="${width-pad}" y2="${height-pad}"></line>
+            <line class="axis" x1="${pad}" y1="${pad}" x2="${pad}" y2="${height-pad}"></line>
+            ${y0 ? `<line class="axis" x1="${pad}" y1="${y0}" x2="${width-pad}" y2="${y0}" opacity="0.5"></line>` : ""}
+            ${p1 ? `<polyline class="line-1h" points="${p1}"></polyline>` : ""}
+            ${p6 ? `<polyline class="line-6h" points="${p6}"></polyline>` : ""}
+          </svg>
+        </div>
+        <div class="chart-legend">
+          <span><span class="dot" style="background:#5b8def"></span>1H</span>
+          <span><span class="dot" style="background:#3dd68c"></span>6H</span>
+        </div>
+      </article>`;
+    }
+
+    async function runBenchmark(){
+      const name = document.getElementById("run-name")?.value || "";
+      const description = document.getElementById("run-description")?.value || "";
+      const status = document.getElementById("run-status");
+      status.textContent = "Запуск benchmark...";
+      try{
+        const r = await fetch(apiUrl("/api/actions/benchmark"),{
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({name,description})
+        });
+        if(!r.ok){throw new Error(`${r.status} ${await r.text()}`);}
+        status.textContent = "Benchmark запущен";
+        await refreshData();
+      }catch(e){
+        status.textContent = `Ошибка: ${e.message}`;
+      }
+    }
+
+    function render(rows, mode){
+      document.getElementById("updated").textContent = `Режим: ${mode} • строк: ${rows.length} • ${new Date().toLocaleString("ru-RU")}`;
+      const byTf = {"1h":[], "6h":[]};
+      for(const r of rows){ if(byTf[r.tf]) byTf[r.tf].push(r); }
+      let html = "";
+
+      if(mode === "dashboard"){
+        html += `<section class="card"><h3>Run benchmark</h3>
+          <div class="controls">
+            <input id="run-name" placeholder="Название запуска (optional)">
+            <textarea id="run-description" placeholder="Описание запуска (optional)"></textarea>
+            <button onclick="runBenchmark()">Run benchmark</button>
+          </div>
+          <div class="mini" id="run-status">Готово</div>
+        </section>`;
+      }
+
+      html += `<section class="grid">`;
+      for(const tf of ["1h","6h"]){
+        const list = byTf[tf];
+        const cur = list[0], prev = list[1];
+        html += `<article class="card"><h3>${tf.toUpperCase()} latest</h3>`;
+        if(!cur){ html += `<div class="mini">Нет данных benchmark</div></article>`; continue; }
+        html += `<div class="metric"><span>run_id</span><span class="nowrap">${cur.run_id || "—"}</span></div>`;
+        html += `<div class="metric"><span>name</span><span>${cur.run_name || "—"}</span></div>`;
+        html += `<div class="metric"><span>gate_auc</span><span>${num(cur.gate_auc)} (${delta(cur.gate_auc, prev?.gate_auc)})</span></div>`;
+        html += `<div class="metric"><span>gate_mcc</span><span>${num(cur.gate_mcc)} (${delta(cur.gate_mcc, prev?.gate_mcc)})</span></div>`;
+        html += `<div class="metric"><span>cascade_static_mcc</span><span>${num(cur.cascade_static_mcc)} (${delta(cur.cascade_static_mcc, prev?.cascade_static_mcc)})</span></div>`;
+        html += `<div class="metric"><span>cascade_dynamic_mcc</span><span>${num(cur.cascade_dynamic_mcc)} (${delta(cur.cascade_dynamic_mcc, prev?.cascade_dynamic_mcc)})</span></div>`;
+        html += `<div class="metric"><span>reg_mae_jump</span><span>${num(cur.reg_mae_jump)} (${delta(cur.reg_mae_jump, prev?.reg_mae_jump)})</span></div>`;
+        html += `<div class="metric"><span>created_at</span><span>${(cur.created_at || "").slice(0,19)}</span></div>`;
+        html += `</article>`;
+      }
+      html += `</section>`;
+
+      html += `<section class="card"><h3>Charts</h3><div class="chart-grid">`;
+      html += chartCard(rows, "gate_auc", "Gate AUC");
+      html += chartCard(rows, "gate_mcc", "Gate MCC");
+      html += chartCard(rows, "cascade_static_mcc", "Cascade Static MCC");
+      html += chartCard(rows, "cascade_dynamic_mcc", "Cascade Dynamic MCC");
+      html += chartCard(rows, "reg_mae_jump", "Reg MAE (jump)");
+      html += `</div></section>`;
+
+      html += `<section class="card"><h3>History</h3><div style="overflow:auto"><table>
+        <thead><tr>
+          <th>created_at</th><th>run_name</th><th>tf</th><th>gate_auc</th><th>gate_mcc</th>
+          <th>cascade_static_mcc</th><th>cascade_dynamic_mcc</th><th>reg_mae_jump</th><th>run_id</th>
+        </tr></thead><tbody>`;
+      for(const r of rows){
+        html += `<tr>
+          <td class="nowrap">${(r.created_at || "").slice(0,19)}</td>
+          <td>${r.run_name || ""}</td>
+          <td>${(r.tf || "").toUpperCase()}</td>
+          <td>${num(r.gate_auc)}</td>
+          <td>${num(r.gate_mcc)}</td>
+          <td>${num(r.cascade_static_mcc)}</td>
+          <td>${num(r.cascade_dynamic_mcc)}</td>
+          <td>${num(r.reg_mae_jump)}</td>
+          <td class="nowrap">${r.run_id || ""}</td>
+        </tr>`;
+      }
+      html += `</tbody></table></div></section>`;
+      document.getElementById("main").innerHTML = html;
+    }
+
+    async function refreshData(){
+      try{
+        const r = await fetch(apiUrl("/api/benchmark?limit=400"));
+        if(!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        const data = await r.json();
+        render(data.rows || [], data.mode || "debug");
+      }catch(e){
+        document.getElementById("updated").textContent = "Ошибка: " + e.message;
+      }
+    }
+    refreshData();
+  </script>
+</body>
+</html>

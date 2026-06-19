@@ -1,0 +1,75 @@
+pair: BTCUSDT
+download_days: 720
+
+paths:
+  artifacts: artifacts
+  raw: artifacts/raw
+  features: artifacts/features
+  models: artifacts/models
+  reports: artifacts/reports
+
+timeframes:
+  1h:
+    train_target: t_static
+    threshold_static: 0.008
+    embargo_bars: 1
+    huber_delta: 0.006
+    future_bars: 24
+    warmup_trim_days: 60
+  6h:
+    train_target: t_static
+    threshold_static: 0.015
+    embargo_bars: 6
+    huber_delta: 0.015
+    future_bars: 28
+    warmup_trim_days: 210
+
+features:
+  num_bars_1h: 2
+  num_bars_6h: 4
+  span_1h: 72
+  span_6h: 210
+  pt_sl_1h: [2.0, 2.0]
+  pt_sl_6h: [2.5, 2.5]
+  min_target: 0.001
+  warmup_days: 210
+  recommended_days_1h: 90
+  recommended_days_6h: 365
+
+tuning:
+  budget: light
+  n_wf_splits: 5
+
+training:
+  test_ratio: 0.2
+  tau_grid_size: 41
+  gate_threshold: 0.5
+  eval_mode: static
+
+inference:
+  cache_ttl_sec: 900
+  gate_threshold: 0.5
+
+scheduler:
+  retrain_interval_sec: 86400
+  broadcast_interval_sec: 1800
+
+ingest:
+  cache_freshness_hours: 2
+  incremental_overlap_days: 3
+
+drift:
+  window_bars_1h: 500
+  window_bars_6h: 100
+  threshold: 0.05
+  check_interval_sec: 3600
+
+bundle:
+  version: "1.0.0"
+  filename: cascade_bundle.pkl
+
+debug:
+  enabled: true
+  host: 127.0.0.1
+  port: 8765
+  # token: set via ADMIN_DEBUG_TOKEN in .env

@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BTC Forecast — Dashboard</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --card: #1a1d27;
+      --border: #2a2f3d;
+      --text: #e6e8ef;
+      --muted: #8b90a0;
+      --accent: #5b8def;
+      --ok: #3dd68c;
+      --warn: #f5a623;
+      --err: #ff5c5c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    header {
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: .5rem;
+    }
+    h1 { margin: 0; font-size: 1.25rem; }
+    .meta { color: var(--muted); font-size: .85rem; }
+    main {
+      padding: 1rem 1.5rem 2rem;
+      display: grid;
+      gap: 1rem;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    }
+    .full { grid-column: 1 / -1; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.1rem;
+    }
+    .card h2 {
+      margin: 0 0 .75rem;
+      font-size: .95rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .metric {
+      display: flex;
+      justify-content: space-between;
+      padding: .35rem 0;
+      border-bottom: 1px solid var(--border);
+      font-size: .9rem;
+    }
+    .metric:last-child { border-bottom: none; }
+    .badge {
+      display: inline-block;
+      padding: .15rem .5rem;
+      border-radius: 4px;
+      font-size: .75rem;
+      font-weight: 600;
+    }
+    .badge.ok { background: #1a3d2e; color: var(--ok); }
+    .badge.warn { background: #3d3018; color: var(--warn); }
+    .badge.err { background: #3d1a1a; color: var(--err); }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, monospace;
+      font-size: .8rem;
+      background: #12141c;
+      padding: .75rem;
+      border-radius: 6px;
+      max-height: 320px;
+      overflow: auto;
+    }
+    .countdown {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: var(--accent);
+    }
+    #errors { color: var(--err); }
+    .controls { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: .6rem; }
+    button {
+      background: #24324f;
+      color: var(--text);
+      border: 1px solid #304061;
+      border-radius: 6px;
+      padding: .45rem .75rem;
+      cursor: pointer;
+      font-size: .85rem;
+    }
+    button:hover { filter: brightness(1.1); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .mini { font-size: .78rem; color: var(--muted); margin-top: .5rem; }
+    input, textarea {
+      background: #12141c;
+      color: var(--text);
+      border: 1px solid #304061;
+      border-radius: 6px;
+      padding: .45rem .6rem;
+      font-size: .82rem;
+    }
+    textarea { min-height: 56px; resize: vertical; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>BTC Forecast — Admin Dashboard</h1>
+      <div class="meta" id="updated">Загрузка…</div>
+    </div>
+    <div class="controls">
+      <button onclick="openBenchmark()">Benchmark</button>
+      <div class="meta">Авто-обновление каждые 5 с</div>
+    </div>
+  </header>
+  <main id="main"></main>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const token = params.get("token");
+    function apiUrl(path) {
+      const u = new URL(path, location.origin);
+      if (token) u.searchParams.set("token", token);
+      return u.toString();
+    }
+    function fmtSec(s) {
+      if (s == null) return "—";
+      if (s < 60) return Math.round(s) + " с";
+      if (s < 3600) return Math.floor(s/60) + " м " + Math.round(s%60) + " с";
+      const h = Math.floor(s/3600);
+      const m = Math.floor((s%3600)/60);
+      return h + " ч " + m + " м";
+    }
+    function badge(ok, yes="OK", no="—") {
+      const cls = ok ? "ok" : "warn";
+      return `<span class="badge ${cls}">${ok ? yes : no}</span>`;
+    }
+    function render(data) {
+      document.getElementById("updated").textContent =
+        "Обновлено: " + new Date(data.timestamp).toLocaleString("ru-RU");
+      const sched = data.scheduler || {};
+      const retrain = sched.retrain || {};
+      const drift = sched.drift || {};
+      const cache = data.cache || {};
+      const bundle = data.bundle;
+      const artifacts = data.artifacts || {};
+      const preview = data.bot_preview || {};
+      const driftData = data.drift || {};
+      const actions = data.actions || {};
+
+      let html = "";
+
+      html += `<section class="card full"><h2>Управление</h2>`;
+      html += `<div class="controls">
+        <button onclick="runAction('ingest', {force:false})">Run ingest</button>
+        <button onclick="runAction('ingest', {force:true})">Run ingest --force</button>
+        <button onclick="runAction('train', {})">Run train</button>
+        <button onclick="runAction('train', {skip_tune:true})">Run train --skip-tune</button>
+        <button onclick="runAction('predict', {refresh:true})">Run predict</button>
+        <button onclick="runBenchmark()">Run benchmark</button>
+      </div>`;
+      html += `<div class="controls">
+        <input id="benchmark-name" placeholder="benchmark name (optional)">
+        <textarea id="benchmark-description" placeholder="benchmark description (optional)"></textarea>
+      </div>`;
+      for (const name of ["ingest","train","predict","benchmark"]) {
+        const a = actions[name] || {};
+        const cls = a.status === "error" ? "err" : (a.status === "running" ? "warn" : "ok");
+        html += `<div class="metric"><span>${name}</span>
+          <span><span class="badge ${cls}">${a.status || "idle"}</span>
+          ${a.running_for_sec != null ? ` ${a.running_for_sec}s` : ""}
+          ${a.duration_sec != null ? ` (${a.duration_sec}s)` : ""}</span></div>`;
+        if (a.last_result) html += `<div class="mini">last_result: ${a.last_result}</div>`;
+        if (a.last_error) html += `<div class="mini" style="color:var(--err)">last_error: ${a.last_error}</div>`;
+        if (a.log) html += `<pre>${a.log}</pre>`;
+      }
+      html += `</section>`;
+
+      html += `<section class="card"><h2>Планировщик</h2>`;
+      html += `<div class="metric"><span>Retrain</span><span class="countdown">${fmtSec(retrain.next_run_in_sec)}</span></div>`;
+      html += `<div class="metric"><span>Интервал retrain</span><span>${fmtSec(retrain.interval_sec)}</span></div>`;
+      html += `<div class="metric"><span>Последний retrain</span><span>${retrain.last_run_at ? new Date(retrain.last_run_at*1000).toLocaleString("ru-RU") : "—"}</span></div>`;
+      html += `<div class="metric"><span>Статус</span><span>${retrain.running ? badge(false,"","Выполняется") : badge(true)} ${retrain.last_error || ""}</span></div>`;
+      html += `<div class="metric"><span>Drift check</span><span class="countdown">${fmtSec(drift.next_run_in_sec)}</span></div>`;
+      html += `</section>`;
+
+      html += `<section class="card"><h2>Кэш прогноза</h2>`;
+      html += `<div class="metric"><span>В кэше</span><span>${badge(cache.cached)}</span></div>`;
+      html += `<div class="metric"><span>TTL</span><span>${fmtSec(cache.ttl_sec)}</span></div>`;
+      html += `<div class="metric"><span>Истекает через</span><span>${fmtSec(cache.expires_in_sec)}</span></div>`;
+      html += `</section>`;
+
+      html += `<section class="card"><h2>Модель</h2>`;
+      if (bundle) {
+        html += `<div class="metric"><span>Версия</span><span>${bundle.version}</span></div>`;
+        html += `<div class="metric"><span>Обучена</span><span>${(bundle.trained_at||"").slice(0,19)}</span></div>`;
+        const m1 = bundle.metrics?.["1h"] || {};
+        const m6 = bundle.metrics?.["6h"] || {};
+        html += `<div class="metric"><span>1H MCC / AUC</span><span>${(m1.cascade_mcc??"—")} / ${(m1.gate_auc??"—")}</span></div>`;
+        html += `<div class="metric"><span>6H MCC / AUC</span><span>${(m6.cascade_mcc??"—")} / ${(m6.gate_auc??"—")}</span></div>`;
+      } else {
+        html += `<p>Bundle не загружен</p>`;
+      }
+      html += `</section>`;
+
+      html += `<section class="card"><h2>Drift</h2>`;
+      for (const tf of ["1h","6h"]) {
+        const d = driftData[tf];
+        if (!d) { html += `<div class="metric"><span>${tf.toUpperCase()}</span><span>—</span></div>`; continue; }
+        html += `<div class="metric"><span>${tf.toUpperCase()} AUC</span><span>${d.auc_recent?.toFixed(3)} / ${d.auc_baseline?.toFixed(3)} ${badge(!d.drifted)}</span></div>`;
+      }
+      html += `</section>`;
+
+      html += `<section class="card"><h2>Артефакты</h2>`;
+      for (const [k,v] of Object.entries(artifacts)) {
+        html += `<div class="metric"><span>${k}</span><span>${v.exists ? v.age_sec+" с назад ("+v.size_kb+" KB)" : badge(false,"","нет")}</span></div>`;
+      }
+      html += `</section>`;
+
+      if (data.errors?.length) {
+        html += `<section class="card full"><h2>Ошибки</h2><pre id="errors">${data.errors.join("\n")}</pre></section>`;
+      }
+
+      html += `<section class="card full"><h2>/summary (пользователям)</h2><pre>${preview.summary || preview.error || "—"}</pre></section>`;
+      html += `<section class="card full"><h2>/forecast (пользователям)</h2><pre>${preview.forecast || "—"}</pre></section>`;
+
+      document.getElementById("main").innerHTML = html;
+    }
+    function openBenchmark() {
+      window.open(apiUrl("/benchmark"), "_blank", "noopener");
+    }
+    async function runBenchmark() {
+      const name = document.getElementById("benchmark-name")?.value || "";
+      const description = document.getElementById("benchmark-description")?.value || "";
+      await runAction("benchmark", {name, description});
+    }
+    async function runAction(action, payload={}) {
+      try {
+        const r = await fetch(apiUrl(`/api/actions/${action}`), {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) {
+          const txt = await r.text();
+          throw new Error(`${r.status} ${txt}`);
+        }
+        await refresh();
+      } catch (e) {
+        document.getElementById("updated").textContent = "Ошибка action: " + e.message;
+      }
+    }
+    async function refresh() {
+      try {
+        const r = await fetch(apiUrl("/api/status"));
+        if (!r.ok) throw new Error(r.status + " " + r.statusText);
+        render(await r.json());
+      } catch (e) {
+        document.getElementById("updated").textContent = "Ошибка: " + e.message;
+      }
+    }
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
