@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import time
 from typing import Any
 
 import vk_api
+from requests.exceptions import ConnectionError, ReadTimeout
 from vk_api import VkUpload
 from vk_api.bot_longpoll import VkBotEventType, VkBotLongPoll
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
@@ -41,7 +43,6 @@ _COMMANDS = {
     "refresh",
 }
 
-# Алиасы: латиница и русские названия.
 _ALIASES = {
     "помощь": "help",
     "команды": "help",
@@ -318,12 +319,20 @@ def _listen_forever(
     upload: VkUpload,
     loop: asyncio.AbstractEventLoop,
 ) -> None:
-    for event in longpoll.listen():
-        if event.type != VkBotEventType.MESSAGE_NEW:
-            continue
-        asyncio.run_coroutine_threadsafe(
-            _guarded_handle(vk, upload, event), loop
-        )
+    while True:
+        try:
+            for event in longpoll.listen():
+                if event.type != VkBotEventType.MESSAGE_NEW:
+                    continue
+                asyncio.run_coroutine_threadsafe(
+                    _guarded_handle(vk, upload, event), loop
+                )
+        except (ReadTimeout, ConnectionError) as e:
+            logger.warning("LongPoll ошибка сети: %s. Перезапуск через 5с...", e)
+            time.sleep(5)
+        except Exception as e:
+            logger.exception("Неизвестная ошибка LongPoll. Перезапуск через 10с...")
+            time.sleep(10)
 
 
 async def run_vk_bot() -> None:
@@ -346,8 +355,8 @@ async def run_vk_bot() -> None:
         for peer_id in settings.vk_admin_id_set:
             try:
                 await asyncio.to_thread(_send_text, vk, int(peer_id), text)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("VK admin message failed: %s", exc)
+            except Exception:
+                logger.warning("VK admin message failed", exc_info=True)
 
     async def user_msg(user_id: int, text: str) -> None:
         await asyncio.to_thread(_send_text, vk, int(user_id), text)
